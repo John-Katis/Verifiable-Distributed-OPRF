@@ -1,6 +1,6 @@
 # v-dOPRF
 
-Rust prototype implementation of the verifiable distributed OPRF protocols described in `overleaf-protocols/`, plus the external Legendre-dOPRF baseline of Kaluđerović, Cheng & Mitrokotsa (ESORICS 2025) used in the evaluation.
+Rust prototype implementation of the verifiable distributed OPRF protocols described in `overleaf-protocols/`, plus the external Legendre-dOPRF baseline of Kaluđerović et al (ESORICS 2025) used in the evaluation.
 
 ## Layout
 
@@ -37,7 +37,7 @@ d-OPRF/                External baseline: Legendre-dOPRF (Kaluđerović et al., 
 
 ## `d-OPRF/` — external baseline
 
-Implementation of the Legendre-OPRF construction by Kaluđerović, Cheng & Mitrokotsa (ESORICS 2025) [[ESORICS:KalCheMit25]](https://eprint.iacr.org/2024/1834), used as the closest available distributed OPRF baseline in §6. Two trees:
+Implementation of the Legendre-OPRF construction by Kaluđerović et al (ESORICS 2025) [[ESORICS:KalCheMit25]](https://eprint.iacr.org/2024/1834), used as the closest available distributed OPRF baseline in §6. Two trees:
 
 - `Legendre-dOPRF/` — original single-machine implementation (https://github.com/nkKolja/Legendre-dOPRF).
 - `Legendre-dOPRF-network/` — network-instrumented fork producing the WAN numbers reported in `bench-e2e`.
