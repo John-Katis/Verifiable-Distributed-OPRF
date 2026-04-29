@@ -1,0 +1,19 @@
+[package]
+name = "vdoprf-bench"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "vdoprf-bench"
+path = "src/main.rs"
+
+[dependencies]
+vdoprf-field = { path = "../field" }
+vdoprf-ss = { path = "../secret-sharing" }
+vdoprf-crypto = { path = "../crypto-primitives" }
+vdoprf-network = { path = "../network" }
+vdoprf-offline = { path = "../offline" }
+vdoprf-online = { path = "../online" }
+num-bigint = "0.4"
+num-traits = "0.2"
+rand = "0.8"

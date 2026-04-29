@@ -1,0 +1,14 @@
+[package]
+name = "vdoprf-online"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vdoprf-field = { path = "../field" }
+vdoprf-ss = { path = "../secret-sharing" }
+vdoprf-crypto = { path = "../crypto-primitives" }
+vdoprf-network = { path = "../network" }
+vdoprf-offline = { path = "../offline" }
+num-bigint = "0.4"
+num-traits = "0.2"
+rand = "0.8"

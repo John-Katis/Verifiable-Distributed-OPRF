@@ -1,0 +1,12 @@
+[package]
+name = "vdoprf-ss"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vdoprf-field = { path = "../field" }
+num-bigint = "0.4"
+num-traits = "0.2"
+itertools = "0.12"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }

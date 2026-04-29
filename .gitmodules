@@ -1,0 +1,3 @@
+[submodule "d-OPRF"]
+	path = d-OPRF
+	url = https://github.com/nann-cheng/d-OPRF.git
