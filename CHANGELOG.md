@@ -1,6 +1,6 @@
 # Changelog
 
-This log groups changes by the finding/task each cluster of edits addresses, rather than by commit or file, so the *why* behind each group of changes stays clear without re-reading every diff. All fixes were re-derived from the paper "High-throughput Verifiable Distributed OPRF from Gold PRF" (`Distributed_VOPRF_over_Gold_PRF (open TODOs).pdf`, repo root) rather than patched ad hoc — two of the "obvious" fixes below turned out to be wrong once checked against the paper's own security analysis (see Group A).
+This log groups changes by the finding/task each cluster of edits addresses, rather than by commit or file, so the *why* behind each group of changes stays clear without re-reading every diff.
 
 ## Group A — Online: genuine F_coin realization for r_k / ε_sigma / ε'_batch / ρ
 
@@ -118,10 +118,35 @@ Added a note on `two_level_leaf` that it computes `H(H(share)‖H(priv))` rather
 - `run_bench.sh`'s `e2e` and `all` commands now also run `./run_legendre_baseline.sh --level all --m 1,100` as a trailing section (previously only the no-args path did this) — `offline`/`online`/`our-protocol-verified-input`/`naive-boyle-aly` stay Rust-only, since Legendre-dOPRF has no offline/online phase split of its own to compare against, only a full end-to-end query. The no-args path is now simply an alias for `all` with no flags, removing the duplication between the two code paths the script previously had.
 - **Follow-up fix found during this pass's own verification:** a full `--level all --m 1,100` run surfaced a real, reproducible failure at `(t,n)=(2,7)`, `m=100` — one of the 100 sequential queries returned `Connection Failed: Connection refused`, which `run_one_query` couldn't parse, and the cell was reported as `FAILED`. Root cause: a transient client/server connection race under rapid repeated server restart (100 restarts of 7 servers in ~8 minutes) — the query itself is stateless and idempotent, so this isn't a protocol bug. Two fixes to `run_legendre_baseline.sh`: (1) the failure-diagnostic log was being deleted *before* the parse-failure check ran, so the printed "see stderr above" pointed at nothing — moved the `rm -f "$log"` to after the check and print the actual client output on failure; (2) added a bounded 3-attempt retry per query in `run_cell`'s loop. Re-ran the exact failing cell (`--level 128 --tn 2,7 --m 100`) after the fix: attempt 97 hit the same `Connection refused`, the retry fired, attempt 2 succeeded, and the full 100-query sum completed correctly (`comm(KB) = 630350.0` = exactly 100 × the single-query 6303.5 KB) — confirmed the fix resolves it rather than masking it.
 
+## Group L — Legendre-dOPRF baseline: genuine 384-bit field infrastructure
+
+**Files:** `d-OPRF` submodule (`Legendre-dOPRF-network/parameters.h`, `.../Makefile`, `.../p384/` (new), `.../network-version/server.c`; submodule commits `6681146`, `8966290`), `run_legendre_baseline.sh`, parent-repo submodule pointer.
+
+**What was wrong.** The vendored Legendre-dOPRF code (Kaluđerović et al., ESORICS'25) only ever shipped `SEC_LEVEL` 0–4 — 64/128/192/256/**512**-bit fields, i.e. `NBYTES_FIELD ∈ {8,16,24,32,64}`. There was no 384-bit field, which is the width the v-dOPRF paper's §Evaluation pins for *both* PRFs (`|p| = 3λ = 384`, so "all benchmarks share the same 𝔽_p"). The originally-submitted Legendre numbers were therefore produced by an **ad-hoc 384-bit configuration that ran on the 512-bit infrastructure**: the element *counts* and the Legendre-symbol batch (`LAMBDA = NBITS_FIELD/2 = 192`) were the true 384-bit values, but each 𝔽_p element was represented and billed at the 512-bit width — 64 bytes, 8×u64, no reduction to a tight 384-bit encoding ("supported, but no wrapping mod 384"). The final aggregation lived in a `.py` script that has since been lost, so this could only be reconstructed after the fact.
+
+**The fix.** Added a real 384-bit field to the submodule (local commits, never pushed upstream):
+- `SEC_LEVEL=5` → `NBITS_FIELD=384`, `NBYTES_FIELD=48` (`parameters.h`), a new `p384/generic/arith_generic.c`, and `client384`/`server384` Makefile targets (submodule `6681146`). The modulus is this repo's own Gold-PRF prime `p = 2^384 − 573·2^128 + 1`, so Legendre now runs over *exactly* the same 𝔽_p as the rest of the evaluation, at a matched λ = 128 post-quantum level.
+- `run_legendre_baseline.sh` builds and drives `client384`/`server384` (`SEC_LEVEL=5`); `FE = 48` bytes throughout, consistent with the `FE = 48` used for our own protocol's numbers.
+- Offline-cost instrumentation in `server.c` (submodule `8966290`) uses `sizeof()` on the actual field structures, so it now reflects the 48-byte width automatically.
+
+**Effect on the reported numbers.** Every 𝔽_p element in the Legendre transcript shrinks 64 → 48 bytes, so **all Legendre communication figures drop to exactly 3/4 (48/64) of the submitted values**; computation and round counts are unchanged (identical element counts, identical `LAMBDA`, same arithmetic). Verified by reconstruction — `submitted_comm ≈ recode_comm × 4/3` at both `(t,n)` points, both `m`:
+
+| point | submitted (KB) | recode (KB) | ratio | 4/3 |
+|---|---|---|---|---|
+| (4,1) m=1   | 4 425.22      | 3 381.0       | 1.309 | 1.333 |
+| (7,2) m=1   | 1 761 188.35  | 1 323 617.9   | 1.331 | 1.333 |
+| (4,1) m=100 | 442 522.00    | 338 100.0     | 1.309 | —     |
+| (7,2) m=100 | 176 118 835   | 132 361 785.9 | 1.331 | —     |
+
+The `(7,2)` point (communication is almost entirely field elements) lands on 4/3 to within 0.2 %; `(4,1)` sits ~1.8 % below, the difference being fixed-size framing (party indices, subset representations, TCP/serialization headers) that does not scale with element width. As a cross-check, running the *actual* 512-bit binary instead gives `(1,4) m=1 = 5996 KB ≈ recode × (4/3)²` — because in the real code `NBYTES_FIELD` *and* `LAMBDA` both scale with bit-width; the submitted numbers' single 4/3 factor confirms only the per-element byte size was 512-bit, not the batch count.
+
+**Not a regression.** The corrected figures are the faithful instantiation of the `|p| = 384` claim the paper already makes; the submitted communication was conservative by 4/3. No comparison in §Evaluation changes — Legendre still loses by orders of magnitude on communication (≈ 1.3 GB at `t = 2`, ≈ 132 GB at `m = 100`).
+
 ## Verification
 
 - `cargo test -p vdoprf-online`, `cargo test -p vdoprf-offline --lib`, `cargo test -p vdoprf-crypto --lib`, `cargo test -p vdoprf-ss`, and `cargo test -p vdoprf-bench` all pass after every group above (Group I: 69 online tests, up from 58; Group J: 7 bench tests, now compiling at all; Group K: 73 online tests, up from 69).
 - `cargo check --workspace` is clean (only pre-existing, unrelated warnings).
 - Group J's CLI was smoke-tested for all seven `Experiment` values (`--n`/`--t`/`--m` overrides and error paths for missing/malformed arguments), and `run_bench.sh`/`run_legendre_baseline.sh` were run end-to-end per Group J's own verification notes above.
 - Group K's CLI was re-smoke-tested for all six remaining `Experiment` values (confirming `our-protocol` is now rejected like any other unknown argument) plus `run_bench.sh e2e`/`all` (confirming the Legendre section now trails the Rust table) and `run_bench.sh offline`/`online`/`our-protocol-verified-input`/`naive-boyle-aly` (confirming they stay Rust-only, no Legendre section).
+- Group L: `run_legendre_baseline.sh` builds and runs against `client384`/`server384` (`SEC_LEVEL=5`, 48-byte field), leaving `git status` on the submodule clean afterward. The 4/3 relationship to the submitted numbers was checked at both `(t,n)` pairs and both `m` (table above); a control run of the unmodified 512-bit binary reproduced the `(4/3)²` overshoot, confirming the submitted figures used 384-bit counts with 512-bit element width rather than the full 512-bit configuration.
 - Two pre-existing issues, unrelated to any change above, were found and left as-is (out of scope for this pass): a doc-comment in `crates/crypto-primitives/src/ntt.rs` is parsed as a failing doctest due to a stray `·` character; and `zkp_vith::tests::test_vith_rejects_wrong_witness` is statistically flaky (~0.4% failure rate) because it draws its GGM seed from real OS randomness at `tau=4` (only 4 repetitions, 1/4 soundness error each) — passed 5/5 in isolated re-runs, confirming the underlying code is correct, just an occasionally-unlucky test parameter choice. (A third pre-existing issue, `crates/bench/src/avg.rs`'s test module not compiling against the current `CommStats`/`bench_avg_split` shapes, was fixed in Group J above.)
