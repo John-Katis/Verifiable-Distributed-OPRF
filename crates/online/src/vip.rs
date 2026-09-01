@@ -22,12 +22,16 @@
 //!   require. Outputs per-server RSS shares of
 //!   `(d^{(γ)}_i, a_i^{(1)}, b_i^{(1)}, σ_i, c_i)` (5-Online.tex:313).
 //!
-//! - [`vip_parallel`] — `Π_VIP^Prl`. Draws every F_coin challenge
-//!   `(r_k, ε_k, ε'_i, ρ)` via a genuine coin toss (`coin_toss`, PRF-keyed
+//! - [`vip_parallel`] — `Π_VIP^Prl`. Draws the fold/batch coefficients
+//!   `(r_k, ε_k, ε'_i)` via a genuine coin toss (`coin_toss`, PRF-keyed
 //!   RSS shares + open) *before* running any `vip_single` instance, so all
-//!   n instances see the same values. Per the paper's Appendix L, the
-//!   Fiat–Shamir transform does not apply to this batched protocol — these
-//!   challenges must stay real coin tosses, not transcript hashes.
+//!   n instances see the same values; the evaluation challenge `ρ` is drawn
+//!   in its own later coin-toss round *after* `Π_RSS.Mul` — it is a
+//!   challenge point for the committed W/U/V polynomials and must not be
+//!   predictable while W's high points are still being computed. Per the
+//!   paper's Appendix L, the Fiat–Shamir transform does not apply to this
+//!   batched protocol — these challenges must stay real coin tosses, not
+//!   transcript hashes.
 //!   Aggregates `c = Σ c_i` and `Σ = Σ ε'_i · σ_i` locally, then runs the
 //!   §5.1 batched triple verification (5-Online.tex:702/728, currently in
 //!   `\if0` in the rendered paper but treated as the target spec): `U(x),
@@ -501,19 +505,23 @@ pub fn vip_parallel(
     let padded_len = max_len.next_power_of_two().max(2);
     let gamma = (padded_len as f64).log2().ceil() as usize;
 
-    // Draw every F_coin challenge Π_VIP^Prl needs *before* running any
-    // `vip_single` instance. Per Appendix L, the Fiat–Shamir transform is
-    // not applicable to the batched VIP protocol, so every one of these
-    // must be a genuine coin toss (`coin_toss`) rather than a transcript
-    // hash — and since a genuine coin toss (unlike Fiat-Shamir) never
-    // depends on committed prover data, there is no ordering requirement
-    // forcing us to interleave these draws with the fold rounds, and no
-    // dependency between draws either. All of `r_k`/`ε_2..ε_γ`/`ε'_i`/`ρ`
-    // are therefore requested — and opened — in a single synchronous
-    // round via `charge_f_coin_batch`, exactly as Appendix M's round
-    // accounting assumes ("FCoin to generate ε'_1,...,ε'_n can be
-    // simultaneously called with FCoin at the last step of the single VIP
-    // protocol"): one `r_Coin` round total, not one round per value.
+    // The fold/batch coefficients `r_k`/`ε_2..ε_γ`/`ε'_i` are drawn *before*
+    // running any `vip_single` instance. Per Appendix L, the Fiat–Shamir
+    // transform is not applicable to the batched VIP protocol, so every one
+    // of these must be a genuine coin toss (`coin_toss`) rather than a
+    // transcript hash. They are safe to draw here — and to open together in
+    // a single `charge_f_coin_batch` round — because none of them is a
+    // challenge *point* for a committed polynomial: `r_k` fold the q-polys
+    // (all committed in the one VSS-send round below), and `ε_sigma`/`ε'`
+    // only linearly combine already-committed σ shares across instances.
+    // This matches Appendix M's round accounting ("FCoin to generate
+    // ε'_1,...,ε'_n can be simultaneously called with FCoin at the last step
+    // of the single VIP protocol"): one `r_Coin` round for the lot.
+    //
+    // `ρ` is deliberately NOT drawn here — see the note further down, right
+    // before it is drawn: it is a challenge point for W/U/V and must stay
+    // unpredictable until W's high points are fixed by Π_RSS.Mul, so it gets
+    // its own `r_Coin` round *after* the multiplication.
     let r_ks: Vec<Fp> = (0..gamma)
         .map(|k| coin_toss(*rand_counter + k as u64, pre_shared, family, modulus))
         .collect();
@@ -531,11 +539,7 @@ pub fn vip_parallel(
         .collect();
     *rand_counter += n as u64;
 
-    // ρ: Protocol 5 step 11.
-    let rho = coin_toss(*rand_counter, pre_shared, family, modulus);
-    *rand_counter += 1;
-
-    let total_coins = gamma + eps_sigma.len() + n + 1;
+    let total_coins = gamma + eps_sigma.len() + n;
     let mut coin_net = SimulatedNetwork::new(n);
     charge_f_coin_batch(&mut coin_net, family, modulus, total_coins);
     let coin_comm = coin_net.stats();
@@ -653,9 +657,22 @@ pub fn vip_parallel(
     };
     comm.merge(&mul_comm);
 
-    // ρ (∉ {1, …, 2n−1} with overwhelming probability — cryptographic prime
-    // → negligible collision) was drawn above via genuine F_coin, before any
-    // `vip_single` instance ran.
+    // ρ: Protocol 5 step 11 — the evaluation challenge for the
+    // `W(ρ) = U(ρ)·V(ρ)` check. Unlike the `r_k`/`ε_sigma`/`ε'` coefficients,
+    // ρ is a challenge *point* for polynomials the parties have now finished
+    // building: W is degree 2(n−1) and its high points W(n+1..2n−1) are only
+    // fixed by the n−1 multiplications just completed. If a server learned ρ
+    // before choosing its multiplication error δ_j it could solve the single
+    // linear constraint W(ρ) = U(ρ)·V(ρ) for δ_j and pass while W ≠ U·V as
+    // polynomials. So ρ is drawn — and opened — in its own genuine F_coin
+    // round *after* Π_RSS.Mul (the analytical model's second `r_Coin`,
+    // App.~efficiency-analysis-online). ρ ∉ {1, …, 2n−1} with overwhelming
+    // probability (cryptographic prime → negligible collision).
+    let rho = coin_toss(*rand_counter, pre_shared, family, modulus);
+    *rand_counter += 1;
+    let mut rho_coin_net = SimulatedNetwork::new(n);
+    charge_f_coin_batch(&mut rho_coin_net, family, modulus, 1);
+    comm.merge(&rho_coin_net.stats());
 
     // Build the 2n−1 known points for W(x): W(i) = d_i for i ∈ {1..n}, plus
     // W(j) computed for j ∈ {n+1, …, 2n−1}. W has degree 2(n−1).

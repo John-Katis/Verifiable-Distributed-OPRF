@@ -101,8 +101,11 @@ pub fn charge_f_coin(net: &mut SimulatedNetwork, family: &SubsetFamily, modulus:
 /// one round: every server broadcasts its RSS shares for all `count`
 /// preprocessed `[r]`'s at once (`count · N' · feb` bytes), rather than
 /// paying a separate round per value. Used by `Π_VIP^Prl` to realise its
-/// `r_k`/`ε_2..ε_γ`/`ε'_i`/`ρ` draws — all independent of each other — as
-/// one round instead of one round each.
+/// `r_k`/`ε_2..ε_γ`/`ε'_i` draws — the fold/batch coefficients — as one
+/// round. It is *not* used to fold in `Π_VIP^Prl`'s `ρ`: `ρ` is a challenge
+/// point for the committed W/U/V polynomials and must be opened only after
+/// `Π_RSS.Mul` fixes W's high points, so it gets its own `charge_f_coin`
+/// round after the multiplication.
 ///
 /// Unlike [`charge_f_coin`], this does *not* call `net.next_round()` —
 /// it only charges bytes at the network's current round. `SimulatedNetwork`
