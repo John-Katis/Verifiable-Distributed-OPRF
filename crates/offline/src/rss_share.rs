@@ -24,7 +24,7 @@
 //! pack).
 
 use num_bigint::BigUint;
-use vdoprf_network::SimulatedNetwork;
+use vdoprf_network::{CommStats, SimulatedNetwork};
 use vdoprf_ss::SubsetFamily;
 
 fn fe_bytes(modulus: &BigUint) -> usize {
@@ -90,13 +90,44 @@ pub fn charge_rss_share_p2p(
 /// transform: `Π_VIP^Prl`'s shared σ-update ε's (`5-Online.tex:169, 190`)
 /// and Boyle's `Π_proveDeg2Rel`'s closing σ-update ε (Protocol 3.3 step 3e).
 pub fn charge_f_coin(net: &mut SimulatedNetwork, family: &SubsetFamily, modulus: &BigUint) {
+    charge_f_coin_batch(net, family, modulus, 1);
+    net.next_round();
+}
+
+/// Same as [`charge_f_coin`], but for `count` independent `F_coin` outputs
+/// opened together in a single synchronous round. Unlike a Fiat–Shamir
+/// challenge sequence, a genuine `F_coin` draw has no dependency on any
+/// other draw, so any number of them can be requested — and opened — in
+/// one round: every server broadcasts its RSS shares for all `count`
+/// preprocessed `[r]`'s at once (`count · N' · feb` bytes), rather than
+/// paying a separate round per value. Used by `Π_VIP^Prl` to realise its
+/// `r_k`/`ε_2..ε_γ`/`ε'_i`/`ρ` draws — all independent of each other — as
+/// one round instead of one round each.
+///
+/// Unlike [`charge_f_coin`], this does *not* call `net.next_round()` —
+/// it only charges bytes at the network's current round. `SimulatedNetwork`
+/// already counts "1 round used" for any activity at all (`num_rounds() =
+/// current_round + 1`), so a caller charging this as the *only* activity on
+/// a fresh, dedicated network gets exactly one round for free; a caller
+/// merging this into a network with other activity in the same round
+/// should likewise not double-advance; a caller that genuinely needs this
+/// batch to land in its own later round should call `net.next_round()`
+/// itself before or after, same as any other charge helper.
+pub fn charge_f_coin_batch(
+    net: &mut SimulatedNetwork,
+    family: &SubsetFamily,
+    modulus: &BigUint,
+    count: usize,
+) {
+    if count == 0 {
+        return;
+    }
     let n_prime = family.subsets_not_containing(0).len();
     let feb = fe_bytes(modulus);
-    let payload_bytes = n_prime * feb;
+    let payload_bytes = n_prime * feb * count;
     for s in 0..family.n {
         net.broadcast(s, vec![0u8; payload_bytes]);
     }
-    net.next_round();
 }
 
 /// Naive RSS.Share — textbook baseline (no `Π_DoubleRand` piggyback).
@@ -197,6 +228,79 @@ pub fn charge_client_rss_share(
     }
 }
 
+/// `Π_Input` (Protocol 9), client-facing rounds 1-2 — shared by both the
+/// standalone and folded variants (step 4's echo, round 3, is charged
+/// separately: see [`charge_input_echo_standalone`], not used by the
+/// folded variant at all).
+///
+/// Round 1 (servers → client): each of the `N = C(n,t)` additive
+/// components is shipped once by its single designated sender
+/// (`covering_policy`), so the client receives `m·N` field elements total
+/// across all `m` inputs, plus one 32-byte `ψ_i` hash per server (`n`
+/// hashes). Round 2 (client → servers): the client broadcasts `m` field
+/// elements to each of the `n` servers.
+///
+/// Cheaper than [`charge_client_rss_share`]'s double-sharing-piggyback
+/// model as `n` grows: `N = C(n,t)` still grows combinatorially, but each
+/// designated sender ships only its own assigned components once (not
+/// every non-`T` holder redundantly), and the client uploads a single
+/// value per server per input rather than a full replicated share.
+pub fn charge_input_client_facing(
+    m: usize,
+    family: &SubsetFamily,
+    modulus: &BigUint,
+) -> CommStats {
+    if m == 0 {
+        return CommStats::default();
+    }
+    let feb = fe_bytes(modulus);
+    let n = family.n;
+    let cap_n = family.subsets.len(); // N = C(n,t)
+
+    // Round 1: servers -> client. m*N field elements (designated
+    // components) + n hash values (ψ_i). Sender tags are arbitrary — see
+    // `charge_client_rss_share`'s comment on the bidirectional bucket.
+    let mut net1 = SimulatedNetwork::new(n);
+    let component_bytes = m * cap_n * feb;
+    if component_bytes > 0 {
+        net1.send_to_client(0, vec![0u8; component_bytes]);
+    }
+    for _ in 0..n {
+        net1.send_to_client(0, vec![0u8; 32]);
+    }
+    let mut comm = net1.stats();
+
+    // Round 2: client -> servers. m field elements broadcast to each of
+    // the n servers — one message per server, for accurate message counts.
+    let mut net2 = SimulatedNetwork::new(n);
+    let u_bytes = m * feb;
+    for recipient in 0..n {
+        net2.send_to_client(recipient, vec![0u8; u_bytes]);
+    }
+    comm.merge(&net2.stats());
+
+    comm
+}
+
+/// `Π_Input` (Protocol 9), step 4 standalone: each of the `n` servers
+/// echoes its 32-byte `χ_i` hash to every other server (all-pairs), 1
+/// round. Used ONLY by the standalone (non-folded) variant — the folded
+/// variant absorbs this into an existing broadcast round at no extra
+/// bytes (see `compute_batch.rs`'s Step 2 hash-exchange fold) and must not
+/// call this.
+pub fn charge_input_echo_standalone(family: &SubsetFamily) -> CommStats {
+    let n = family.n;
+    let mut net = SimulatedNetwork::new(n);
+    for sender in 0..n {
+        for recipient in 0..n {
+            if recipient != sender {
+                net.send_p2p(sender, recipient, vec![0u8; 32]);
+            }
+        }
+    }
+    net.stats()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,5 +361,47 @@ mod tests {
         assert_eq!(stats.broadcast_bytes, 0);
         // (n + t + 1) = 5 + 2 + 1 = 8 Fp.
         assert_eq!(stats.client_bytes, 8 * feb);
+    }
+
+    #[test]
+    fn charge_input_client_facing_matches_formula() {
+        let n = 5;
+        let t = 2;
+        let family = SubsetFamily::new(n, t);
+        let modulus = BigUint::from(65537u32);
+        let feb = fe_bytes(&modulus);
+        let cap_n = family.subsets.len(); // C(5,2) = 10
+        let m = 3;
+
+        let stats = charge_input_client_facing(m, &family, &modulus);
+        assert_eq!(stats.p2p_bytes, 0);
+        assert_eq!(stats.broadcast_bytes, 0);
+        // Round 1: m*N field elements + n hashes; round 2: m*n field
+        // elements. All client-facing.
+        let expected = m * cap_n * feb + n * 32 + m * n * feb;
+        assert_eq!(stats.client_bytes, expected);
+        // Two dedicated networks merged sequentially -> 2 rounds.
+        assert_eq!(stats.rounds, 2);
+    }
+
+    #[test]
+    fn charge_input_client_facing_empty_is_free() {
+        let family = SubsetFamily::new(3, 1);
+        let modulus = BigUint::from(65537u32);
+        let stats = charge_input_client_facing(0, &family, &modulus);
+        assert_eq!(stats.client_bytes, 0);
+    }
+
+    #[test]
+    fn charge_input_echo_standalone_matches_formula() {
+        let n = 5;
+        let t = 2;
+        let family = SubsetFamily::new(n, t);
+        let stats = charge_input_echo_standalone(&family);
+        assert_eq!(stats.client_bytes, 0);
+        assert_eq!(stats.broadcast_bytes, 0);
+        // All-pairs echo: n*(n-1) messages of 32 bytes each.
+        assert_eq!(stats.p2p_bytes, n * (n - 1) * 32);
+        assert_eq!(stats.rounds, 1);
     }
 }

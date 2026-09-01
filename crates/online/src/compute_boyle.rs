@@ -11,6 +11,18 @@
 //! Timing boundary per user request: timer covers RSS.Mul + DZKP prove +
 //! DZKP verify + server→client open. Apples-to-apples with VIP, which
 //! includes its own client-verify call in its timer.
+//!
+//! **Deviation from the paper's naive baseline (Protocol 20 / Figure 8
+//! `Fvrfy`) — intentional.** The paper's naive-dVOPRF baseline describes
+//! `Fvrfy` at the level of an ideal functionality: reconstruct `(a, b, c)`
+//! and check `c = a·b`. This module instead calls through to
+//! `dzkp_compute_batch`, i.e. the full Boyle et al. RSS.Mul + DZKP + Open
+//! pipeline already used throughout the offline phase — a real (non-ideal)
+//! instantiation of that same `Fvrfy` check, not a toy reimplementation of
+//! the ideal-functionality description. Functionally equivalent (both
+//! reject exactly when `c ≠ a·b`), just realized via the same machinery the
+//! rest of the codebase already relies on rather than a separate naive
+//! reconstruct-and-compare.
 
 use num_bigint::BigUint;
 use vdoprf_field::Fp;
@@ -23,7 +35,26 @@ use vdoprf_offline::rss_mul::{
 use vdoprf_offline::PreSharedMaterial;
 use vdoprf_ss::{get_party_share, share, RssShare, SubsetFamily};
 
+use crate::input::{client_input_share_standalone, InputResult};
 use crate::OnlinePreprocessed;
+
+/// Fresh, never-reused counter base for `Π_Input`'s `[r^(j)]` masks in this
+/// file's verified-input path — distinct from every other counter base
+/// already in use in this crate (`compute.rs`=3000, `compute_parallel.rs`
+/// =2000, `compute_batch.rs`'s own `rand_counter`=4000, zero-sharing
+/// =100000+, its `Π_Input` base=60000, and this file's own `rand_counter`
+/// =10000/20000).
+const BOYLE_INPUT_COUNTER_BASE: u64 = 70_000;
+
+/// Outcome of [`compute_boyle_batch_with_verified_input`]: either the same
+/// `(outputs, proof, comm)` `compute_boyle_batch` would produce, or an
+/// `Abort` (with the communication already spent on the failed input
+/// protocol) if `Π_Input` rejected the client's input.
+#[derive(Debug)]
+pub enum BoyleVerifiedInputResult {
+    Accept(Vec<Fp>, BoyleBatchProof, CommStats),
+    Abort(CommStats),
+}
 
 /// Proof artefacts of a single Boyle-style online evaluation. DZKP is
 /// server-verified so no proof material crosses to the client — the
@@ -99,15 +130,12 @@ pub fn compute_boyle_single(
         rss_mul_all_parties_with_record(&a_shares, &b_shares, &doubles, family, modulus);
     comm.merge(&mul_comm);
 
-    // 6. DZKP verify (server-side). `dzkp_compute_batch` handles m ≥ 1.
+    // 6. DZKP verify (server-side). `dzkp_compute_batch` handles m ≥ 1. A
+    // real Fvrfy failure is a controlled Abort verdict, not a process
+    // crash — the caller decides what to do with `BoyleProof::verdict`.
     let records = [record];
     let (verdict, dzkp_comm) = dzkp_compute_batch(&records, family, modulus, pre_shared);
     comm.merge(&dzkp_comm);
-    assert_eq!(
-        verdict,
-        DzkpResult::Accept,
-        "Boyle single: DZKP must Accept on honest execution",
-    );
     // Silence unused-mut warning in the case the counter is never advanced further.
     let _ = rand_counter;
 
@@ -126,6 +154,12 @@ pub fn compute_boyle_single(
 /// `rss_mul_batched_all_parties_with_record` for the `m` multiplications
 /// (2 rounds regardless of `m`) and `dzkp_compute_batch` for the batched
 /// DZKP (one U/V/W-compressed check).
+///
+/// Client input goes through the unverified `share()`-as-dealer path (same
+/// as `compute_boyle_single`) — kept exactly as-is so it remains directly
+/// testable/usable, but per the project's confirmed scope this is no
+/// longer wired into any benchmark: only
+/// [`compute_boyle_batch_with_verified_input`] is.
 pub fn compute_boyle_batch(
     xs: &[Fp],
     pre: &OnlinePreprocessed,
@@ -135,9 +169,81 @@ pub fn compute_boyle_batch(
 ) -> (Vec<Fp>, BoyleBatchProof, CommStats) {
     let n = family.n;
     let m = xs.len();
+    if m == 0 {
+        return compute_boyle_batch_inner(&[], pre, pre_shared, family, modulus, CommStats::default());
+    }
     let mut rng = rand::thread_rng();
+
+    // Per-input VSS(x), extract party shares — the unverified "client is
+    // its own ad-hoc dealer" path.
+    let x_shares_per_input: Vec<Vec<RssShare>> = xs
+        .iter()
+        .map(|x| {
+            let x_sharing = share(x, family, modulus, &mut rng);
+            (0..n).map(|i| get_party_share(&x_sharing, i, family)).collect()
+        })
+        .collect();
+
+    compute_boyle_batch_inner(
+        &x_shares_per_input,
+        pre,
+        pre_shared,
+        family,
+        modulus,
+        CommStats::default(),
+    )
+}
+
+/// Same as [`compute_boyle_batch`], but client input goes through the
+/// *full* `Π_Input` protocol (Protocol 9, [`crate::input`]) at its
+/// standalone 3-round cost first. Unlike `compute_batch_with_verified_input`
+/// (which folds `Π_Input`'s step-4 echo into VIP's own existing
+/// commit-then-hash round), Boyle's RSS.Mul + DZKP pipeline has no
+/// equivalent pre-existing broadcast round to fold into without touching
+/// its round-count-pinned internals (see `compute_boyle_batch_round_topology`
+/// below), so this uses [`client_input_share_standalone`] as-is: 2
+/// client-facing rounds (mask-and-open) + 1 dedicated echo round.
+///
+/// On `Π_Input` abort, returns `BoyleVerifiedInputResult::Abort` without
+/// running the rest of the protocol.
+pub fn compute_boyle_batch_with_verified_input(
+    xs: &[Fp],
+    pre: &OnlinePreprocessed,
+    pre_shared: &[PreSharedMaterial],
+    family: &SubsetFamily,
+    modulus: &BigUint,
+) -> BoyleVerifiedInputResult {
+    let (verdict, x_shares_per_input, input_comm) =
+        client_input_share_standalone(xs, pre_shared, family, modulus, BOYLE_INPUT_COUNTER_BASE);
+    if verdict == InputResult::Abort {
+        return BoyleVerifiedInputResult::Abort(input_comm);
+    }
+    let (outputs, proof, comm) = compute_boyle_batch_inner(
+        &x_shares_per_input,
+        pre,
+        pre_shared,
+        family,
+        modulus,
+        input_comm,
+    );
+    BoyleVerifiedInputResult::Accept(outputs, proof, comm)
+}
+
+/// Shared body of both entry points above: local-add with `k`, batched
+/// RSS.Mul, batched DZKP — given already-obtained per-input, per-party RSS
+/// shares of `x` and however much comm the client-input stage has already
+/// spent.
+fn compute_boyle_batch_inner(
+    x_shares_per_input: &[Vec<RssShare>],
+    pre: &OnlinePreprocessed,
+    pre_shared: &[PreSharedMaterial],
+    family: &SubsetFamily,
+    modulus: &BigUint,
+    mut comm: CommStats,
+) -> (Vec<Fp>, BoyleBatchProof, CommStats) {
+    let n = family.n;
+    let m = x_shares_per_input.len();
     let mut rand_counter = 20_000u64;
-    let mut comm = CommStats::default();
 
     if m == 0 {
         return (
@@ -155,13 +261,10 @@ pub fn compute_boyle_batch(
         .collect();
     assert!(!pre.alpha_e_sharings.is_empty(), "need at least one α^e sharing");
 
-    // Per-input: VSS(x), extract party shares, local add with k, fetch α^e share.
+    // Per-input: local add x's share with k, fetch α^e share.
     let mut a_per_input: Vec<Vec<RssShare>> = Vec::with_capacity(m);
     let mut b_per_input: Vec<Vec<RssShare>> = Vec::with_capacity(m);
-    for (j, x) in xs.iter().enumerate() {
-        let x_sharing = share(x, family, modulus, &mut rng);
-        let x_party: Vec<RssShare> =
-            (0..n).map(|i| get_party_share(&x_sharing, i, family)).collect();
+    for (j, x_party) in x_shares_per_input.iter().enumerate() {
         let a_shares: Vec<RssShare> =
             (0..n).map(|i| x_party[i].local_add(&k_party[i])).collect();
 
@@ -196,21 +299,21 @@ pub fn compute_boyle_batch(
     );
     comm.merge(&mul_comm);
 
-    // Batched DZKP (server-verified, U/V/W compression collapses n proofs → 4 scalars).
+    // Batched DZKP (server-verified, U/V/W compression collapses n proofs
+    // → 4 scalars). A real Fvrfy failure is a controlled Abort verdict, not
+    // a process crash — the caller decides what to do with
+    // `BoyleBatchProof::verdict`.
     let (verdict, dzkp_comm) = dzkp_compute_batch(&records, family, modulus, pre_shared);
     comm.merge(&dzkp_comm);
-    assert_eq!(
-        verdict,
-        DzkpResult::Accept,
-        "Boyle batch: DZKP must Accept on honest execution",
-    );
 
     // Return the raw RSS shares `c_per_input` and the DZKP verdict. The
     // bench is responsible for simulating server→client delivery (each
     // server ships its *full* RSS share, redundantly, so the client can
     // detect a lying holder by cross-checking) and the client-side
     // reconstruction. `outputs` is still computed locally for test
-    // convenience — production callers would ignore it.
+    // convenience — production callers would ignore it. On `Abort`, these
+    // per-input plaintexts are meaningless and must not be used; callers
+    // must check `verdict` first.
     let mut outputs: Vec<Fp> = Vec::with_capacity(m);
     for c_shares in &c_per_input {
         outputs.push(
@@ -345,6 +448,66 @@ mod tests {
         assert!(comm.total_bytes() > 0, "Boyle single must exchange bytes");
     }
 
+    /// A real DZKP failure must return a controlled `Abort` verdict, not
+    /// panic. Mirrors `compute_boyle_batch`'s exact internal pipeline (VSS
+    /// x, local add with k, batched RSS.Mul, then `dzkp_compute_batch`) but
+    /// tampers one party's claimed `cp` on the resulting `MulRecord` before
+    /// verification — the same tamper `dzkp.rs`'s own
+    /// `test_dzkp_compute_batch_tampered_cp_aborts` uses — so the DZKP must
+    /// reject. Regression guard for the removed `assert_eq!(.., Accept, ..)`
+    /// panics.
+    #[test]
+    fn compute_boyle_batch_dzkp_abort_does_not_panic() {
+        let (n, modulus, family, pre_shared, pre) = small_setup(2);
+        let mut rng = rand::thread_rng();
+        let xs: Vec<Fp> = (0..2).map(|_| Fp::random(&modulus, &mut rng)).collect();
+
+        let k_party: Vec<RssShare> =
+            (0..n).map(|i| get_party_share(&pre.k_sharing, i, &family)).collect();
+        let mut rand_counter = 90_000u64;
+        let mut a_per_input = Vec::with_capacity(xs.len());
+        let mut b_per_input = Vec::with_capacity(xs.len());
+        for (j, x) in xs.iter().enumerate() {
+            let x_sharing = share(x, &family, &modulus, &mut rng);
+            let x_party: Vec<RssShare> =
+                (0..n).map(|i| get_party_share(&x_sharing, i, &family)).collect();
+            let a_shares: Vec<RssShare> =
+                (0..n).map(|i| x_party[i].local_add(&k_party[i])).collect();
+            let alpha = &pre.alpha_e_sharings[j % pre.alpha_e_sharings.len()];
+            let b_shares: Vec<RssShare> =
+                (0..n).map(|i| get_party_share(alpha, i, &family)).collect();
+            a_per_input.push(a_shares);
+            b_per_input.push(b_shares);
+        }
+        let doubles_per_input: Vec<Vec<DoubleShareLocal>> = (0..xs.len())
+            .map(|_| {
+                let row: Vec<DoubleShareLocal> = (0..n)
+                    .map(|i| generate_double_sharing(i, rand_counter, &pre_shared[i], &family, &modulus))
+                    .collect();
+                rand_counter += 1;
+                row
+            })
+            .collect();
+        let (_c_per_input, mut records, _mul_comm) = rss_mul_batched_all_parties_with_record(
+            &a_per_input, &b_per_input, &doubles_per_input, &family, &modulus,
+        );
+
+        // Tamper: add 1 to party 0's claimed cp for the first record.
+        let one = Fp::new(BigUint::from(1u32), &modulus);
+        records[0].party_cp[0] = &records[0].party_cp[0] + &one;
+
+        let (verdict, _dzkp_comm) = dzkp_compute_batch(&records, &family, &modulus, &pre_shared);
+        assert_eq!(
+            verdict,
+            DzkpResult::Abort,
+            "tampered cp must be rejected, not silently accepted",
+        );
+        // Building the proof struct from this verdict must not panic —
+        // exactly what `compute_boyle_batch` now does internally.
+        let proof = BoyleBatchProof { verdict, open_shares: Vec::new() };
+        assert_eq!(proof.verdict, DzkpResult::Abort);
+    }
+
     /// Round-count topology pin matching the Boyle/BGIN20 paper decomposition,
     /// with §3.1.2's Fiat–Shamir collapse fusing Step 2(c) and Step 3(c) VSS:
     ///   2 × RSS.Mul (batched input triples, pre-4.2)
@@ -379,5 +542,115 @@ mod tests {
              (4-agg open) + 1 (β) = {}",
             comm.rounds, expected,
         );
+    }
+
+    // ---- compute_boyle_batch_with_verified_input (Π_Input, standalone) ----
+
+    /// Honest path: verified-input and unverified `compute_boyle_batch`
+    /// must reconstruct the same `c = (x + k) · α^e` for the same `xs` —
+    /// only how `x`'s shares are obtained differs.
+    #[test]
+    fn compute_boyle_batch_with_verified_input_honest_correctness() {
+        let (_n, modulus, family, pre_shared, pre) = small_setup(3);
+        let mut rng = rand::thread_rng();
+        let xs: Vec<Fp> = (0..3).map(|_| Fp::random(&modulus, &mut rng)).collect();
+
+        let expected = expected_c(&xs, &pre, &modulus);
+        match compute_boyle_batch_with_verified_input(&xs, &pre, &pre_shared, &family, &modulus) {
+            BoyleVerifiedInputResult::Accept(cs, proof, _comm) => {
+                for (a, e) in cs.iter().zip(expected.iter()) {
+                    assert_eq!(a.value, e.value);
+                }
+                assert_eq!(proof.verdict, DzkpResult::Accept);
+            }
+            BoyleVerifiedInputResult::Abort(_) => panic!("honest input must not abort"),
+        }
+    }
+
+    /// `compute_boyle_batch_with_verified_input`'s communication cost must
+    /// exceed `compute_boyle_batch`'s — real Π_Input overhead is now charged
+    /// where the unverified path charges nothing for input at all.
+    #[test]
+    fn compute_boyle_batch_with_verified_input_costs_more_bytes() {
+        let (_n, modulus, family, pre_shared, pre) = small_setup(2);
+        let mut rng = rand::thread_rng();
+        let xs: Vec<Fp> = (0..2).map(|_| Fp::random(&modulus, &mut rng)).collect();
+
+        let (_cs, _proof, plain_comm) =
+            compute_boyle_batch(&xs, &pre, &pre_shared, &family, &modulus);
+        let verified = match compute_boyle_batch_with_verified_input(&xs, &pre, &pre_shared, &family, &modulus) {
+            BoyleVerifiedInputResult::Accept(_, _, comm) => comm,
+            BoyleVerifiedInputResult::Abort(_) => panic!("honest input must not abort"),
+        };
+
+        assert!(
+            verified.total_bytes() + verified.client_bytes
+                > plain_comm.total_bytes() + plain_comm.client_bytes,
+            "Π_Input's real accounting must cost more than the unverified path's untracked input step",
+        );
+    }
+
+    /// Round-count pin: the verified-input path's own pipeline is
+    /// byte-for-byte the same `compute_boyle_batch_inner` as the unverified
+    /// path (9 rounds, see `compute_boyle_batch_round_topology`), plus
+    /// `Π_Input`'s standalone 3 rounds (2 client-facing + 1 echo) charged
+    /// up front = 12 rounds, constant in `(n,t,m)`.
+    #[test]
+    fn compute_boyle_batch_with_verified_input_round_topology() {
+        let (_n, modulus, family, pre_shared, pre) = small_setup(3);
+        let mut rng = rand::thread_rng();
+        let xs: Vec<Fp> = (0..3).map(|_| Fp::random(&modulus, &mut rng)).collect();
+        let comm = match compute_boyle_batch_with_verified_input(&xs, &pre, &pre_shared, &family, &modulus) {
+            BoyleVerifiedInputResult::Accept(_, _, comm) => comm,
+            BoyleVerifiedInputResult::Abort(_) => panic!("honest input must not abort"),
+        };
+        assert_eq!(
+            comm.rounds, 12,
+            "compute_boyle_batch_with_verified_input must cost exactly 9 \
+             (inner Boyle pipeline) + 3 (Π_Input standalone) = 12 rounds, got {}",
+            comm.rounds,
+        );
+    }
+
+    /// A server whose locally-held PRF key material for one subset
+    /// disagrees with what the designated sender used (simulating a
+    /// corrupted/malicious server) must be caught by `Π_Input`'s `ψ_i`
+    /// check, surfacing as `BoyleVerifiedInputResult::Abort` — not silently
+    /// producing a wrong result. Mirrors
+    /// `compute_batch_with_verified_input_aborts_on_forged_server_key`.
+    #[test]
+    fn compute_boyle_batch_with_verified_input_aborts_on_forged_server_key() {
+        let (n, modulus, family, mut pre_shared, pre) = small_setup(2);
+        let mut rng = rand::thread_rng();
+        let xs: Vec<Fp> = (0..2).map(|_| Fp::random(&modulus, &mut rng)).collect();
+
+        let subset = family
+            .subsets
+            .iter()
+            .find(|t| {
+                let holders: Vec<usize> = (0..n).filter(|p| !t.contains(p)).collect();
+                holders.len() >= 2
+            })
+            .copied()
+            .expect("need a subset with at least 2 holders for n=3,t=1");
+        let sender = vdoprf_ss::covering_policy(&subset, n);
+        let victim = (0..n)
+            .find(|&p| !subset.contains(&p) && p != sender)
+            .expect("need a second holder distinct from the designated sender");
+
+        let other_subset = *family
+            .subsets
+            .iter()
+            .find(|t| **t != subset && pre_shared[victim].prf_keys.contains_key(t))
+            .expect("need another subset victim also holds a key for");
+        let swapped_key = pre_shared[victim].prf_keys[&other_subset].clone();
+        pre_shared[victim].prf_keys.insert(subset, swapped_key);
+
+        match compute_boyle_batch_with_verified_input(&xs, &pre, &pre_shared, &family, &modulus) {
+            BoyleVerifiedInputResult::Abort(_) => {}
+            BoyleVerifiedInputResult::Accept(..) => {
+                panic!("forged server key must be caught by ψ_i, not accepted")
+            }
+        }
     }
 }

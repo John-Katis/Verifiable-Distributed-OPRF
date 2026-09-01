@@ -367,6 +367,33 @@ impl RssShare {
         }
     }
 
+    /// Subtract a PUBLIC scalar from this RSS-shared value, preserving RSS
+    /// validity (every holder of a given subset must keep reporting the
+    /// *same* value for it). Exactly one reference subset —
+    /// `family.subsets[0]` — absorbs the adjustment (so the reconstructed
+    /// secret shifts by the scalar exactly once, not once per subset); but
+    /// unlike `deg_mul`/`rss_to_additive`'s "one designated party" pattern
+    /// (correct for RSS→*additive* conversion, where redundancy would
+    /// double-count), here **every** party that holds that reference
+    /// subset applies the identical adjustment to its own copy — since
+    /// they all started from the same replicated value and apply the same
+    /// delta, they all end up with the same new value, keeping the result
+    /// a valid RSS share usable in further RSS operations (`local_add`,
+    /// cross-multiplication, etc.), not just a one-shot reconstruction.
+    /// Parties that don't hold the reference subset are unaffected (they
+    /// never held that component).
+    pub fn local_sub_public(&self, scalar: &Fp, family: &SubsetFamily) -> RssShare {
+        let canonical = &family.subsets[0];
+        let mut shares = self.shares.clone();
+        if let Some(v) = shares.get_mut(canonical) {
+            *v = &*v - scalar;
+        }
+        RssShare {
+            party_id: self.party_id,
+            shares,
+        }
+    }
+
     /// Local scalar multiplication.
     pub fn local_scalar_mul(&self, scalar: &Fp) -> RssShare {
         let shares: BTreeMap<SubsetT, Fp> = self
@@ -826,6 +853,44 @@ mod tests {
         }
         let rs = ReplicatedSharing { components: sum_sharing };
         assert_eq!(rs.reconstruct(&p).value, expected.value);
+    }
+
+    #[test]
+    fn test_local_sub_public() {
+        let p = modulus();
+        let family = SubsetFamily::new(3, 1);
+        let mut rng = rand::thread_rng();
+
+        let secret = Fp::new(BigUint::from(50u32), &p);
+        let delta = Fp::new(BigUint::from(17u32), &p);
+        let expected = &secret - &delta;
+
+        let sharing = share(&secret, &family, &p, &mut rng);
+        let party_shares: Vec<RssShare> = (0..3)
+            .map(|i| get_party_share(&sharing, i, &family).local_sub_public(&delta, &family))
+            .collect();
+
+        assert_eq!(
+            ReplicatedSharing::reconstruct_from_party_shares(&party_shares, &p).value,
+            expected.value,
+        );
+
+        // Every holder of the canonical subset must apply the *same*
+        // adjustment to its own copy (RSS validity: all holders of a
+        // subset must keep reporting the same value for it); every other
+        // component, for every party, is untouched.
+        let canonical = &family.subsets[0];
+        for i in 0..3 {
+            let before = get_party_share(&sharing, i, &family);
+            let after = &party_shares[i];
+            for (t, v) in &before.shares {
+                if t == canonical {
+                    assert_eq!((v - &delta).value, after.shares[t].value);
+                } else {
+                    assert_eq!(v.value, after.shares[t].value, "non-canonical components must be unchanged");
+                }
+            }
+        }
     }
 
     #[test]

@@ -300,6 +300,15 @@ fn private_indices(num_instances: usize) -> Vec<usize> {
 }
 
 /// Compute the two-level column leaf used for the Merkle tree over `rt_w`.
+///
+/// Deviates from the paper's literal formula `H(Ŵ_share,j ‖ H(Ŵ_priv,j))`
+/// (raw share values concatenated with the private-row hash) — this instead
+/// computes `H(H(share) ‖ H(priv))`, i.e. it additionally hashes the share
+/// values before combining. Intentional and still sound: collision
+/// resistance is unaffected, and a verifier holding only the share values
+/// can still independently recompute `share_hash` and check it against the
+/// leaf without ever seeing the private rows (see
+/// `ligero_verify_partial_opening` and its test).
 fn two_level_leaf(column: &[Fp], num_instances: usize) -> [u8; 32] {
     let share_vals: Vec<Fp> = share_indices(num_instances)
         .iter()
@@ -714,14 +723,25 @@ pub fn ligero_prove(
     // index pairs directly so (pos, pos+1) never wraps into a witness column.
     let num_pairs = (n_c - n_k) / 2;
     assert!(num_pairs >= params.num_queries);
-    let mut query_positions: Vec<usize> = Vec::new();
+    // Resample on a duplicate `pair_idx` (rather than silently dropping it)
+    // so `query_positions.len()` always equals exactly `params.num_queries`
+    // — dropping duplicates would sample fewer than the nominal parameter,
+    // weakening the soundness margin below what `params.num_queries` was
+    // chosen to guarantee. `ligero_verify`'s sampling loop below must stay
+    // structurally identical (same challenge_index + append_bytes sequence
+    // per retry) so both sides derive the same positions.
+    let mut query_positions: Vec<usize> = Vec::with_capacity(params.num_queries);
     for q in 0..params.num_queries {
-        let pair_idx = transcript.challenge_index(num_pairs);
-        let pos = n_k + 2 * pair_idx;
-        if !query_positions.contains(&pos) {
+        loop {
+            let pair_idx = transcript.challenge_index(num_pairs);
+            let pos = n_k + 2 * pair_idx;
+            transcript.append_bytes(&(q as u64).to_be_bytes());
+            if query_positions.contains(&pos) {
+                continue;
+            }
             query_positions.push(pos);
+            break;
         }
-        transcript.append_bytes(&(q as u64).to_be_bytes());
     }
 
     let opened_columns_j: Vec<Vec<Fp>> =
@@ -806,6 +826,16 @@ pub fn ligero_verify(
     {
         return false;
     }
+    if proof.opened_columns_j.len() != proof.query_positions.len()
+        || proof.opened_columns_next.len() != proof.query_positions.len()
+        || proof.merkle_paths_j.len() != proof.query_positions.len()
+        || proof.merkle_paths_next.len() != proof.query_positions.len()
+    {
+        // A malformed/adversarial proof with fewer entries than
+        // `query_positions` must be rejected here, not reach the indexing
+        // loop below (which would panic with an out-of-bounds index).
+        return false;
+    }
 
     // Merkle verification for queried column pairs (two-level leaf for Ŵ;
     // single-leaf hash for Ĉ). Pairs are always (j, j+1) with j+1 < n_c by
@@ -860,14 +890,22 @@ pub fn ligero_verify(
     if num_pairs < params.num_queries {
         return false;
     }
-    let mut expected_positions: Vec<usize> = Vec::new();
+    // Must stay structurally identical to `ligero_prove`'s sampling loop
+    // (resample on duplicate, same challenge_index + append_bytes sequence
+    // per retry) so both sides derive the same `params.num_queries`
+    // positions.
+    let mut expected_positions: Vec<usize> = Vec::with_capacity(params.num_queries);
     for q in 0..params.num_queries {
-        let pair_idx = transcript.challenge_index(num_pairs);
-        let pos = n_k + 2 * pair_idx;
-        if !expected_positions.contains(&pos) {
+        loop {
+            let pair_idx = transcript.challenge_index(num_pairs);
+            let pos = n_k + 2 * pair_idx;
+            transcript.append_bytes(&(q as u64).to_be_bytes());
+            if expected_positions.contains(&pos) {
+                continue;
+            }
             expected_positions.push(pos);
+            break;
         }
-        transcript.append_bytes(&(q as u64).to_be_bytes());
     }
     if expected_positions != proof.query_positions {
         return false;
@@ -1075,6 +1113,79 @@ mod tests {
         // Opened columns have 4*1 + 2 = 6 entries.
         assert_eq!(proof.opened_columns_j[0].len(), NUM_DATA_ROWS + NUM_SHARED_BLINDING);
         assert!(ligero_verify(&proof, std::slice::from_ref(&delta), &params, &p));
+    }
+
+    /// A malformed/adversarial proof with fewer `opened_columns_j` entries
+    /// than `query_positions` must be rejected with `false`, not panic with
+    /// an out-of-bounds index inside the verification loop.
+    #[test]
+    fn test_ligero_verify_rejects_short_opened_columns_without_panic() {
+        let p = test_modulus();
+        let w = make_witness(&[3, 5, 7], &[10, 20, 30], &p);
+        let delta = w.compute_delta(&p);
+        let params = LigeroParams::new(3, 8, &p);
+        let mut proof = ligero_prove(&[&w], std::slice::from_ref(&delta), &params, &p);
+        assert!(proof.query_positions.len() >= 1, "test needs at least one query");
+
+        // Truncate opened_columns_j so it's shorter than query_positions.
+        proof.opened_columns_j.pop();
+        assert!(!ligero_verify(&proof, std::slice::from_ref(&delta), &params, &p));
+    }
+
+    /// Regression guard for "dedup can silently under-sample": force
+    /// `num_queries` close to `num_pairs` (a small, hand-built RS domain
+    /// bypassing `LigeroParams::new`'s soundness-driven `n_c` search) so a
+    /// `pair_idx` collision is virtually certain across a handful of
+    /// witnesses, and confirm `query_positions` always has *exactly*
+    /// `num_queries` distinct entries — never fewer, regardless of
+    /// collisions during sampling.
+    #[test]
+    fn test_ligero_query_positions_exactly_num_queries_under_forced_collisions() {
+        let p = test_modulus();
+        let n_c = 16;
+        let n_k = 3;
+        let omega = find_primitive_root_of_unity(n_c, &p).expect("root of unity must exist");
+        let num_pairs = (n_c - n_k) / 2;
+        let params = LigeroParams {
+            n_c,
+            n_k,
+            kappa: 8,
+            num_queries: num_pairs,
+            omega,
+        };
+
+        let mut saw_len_below_num_queries_ever = false;
+        for seed in 0u32..20 {
+            let w = make_witness(
+                &[3 + seed, 5 + seed, 7 + seed],
+                &[10 + seed, 20 + seed, 30 + seed],
+                &p,
+            );
+            let delta = w.compute_delta(&p);
+            let proof = ligero_prove(&[&w], std::slice::from_ref(&delta), &params, &p);
+
+            assert_eq!(
+                proof.query_positions.len(),
+                params.num_queries,
+                "seed {seed}: query_positions must never be shorter than num_queries",
+            );
+            let mut sorted = proof.query_positions.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(
+                sorted.len(),
+                params.num_queries,
+                "seed {seed}: query_positions must contain no duplicates",
+            );
+            if proof.query_positions.len() < params.num_queries {
+                saw_len_below_num_queries_ever = true;
+            }
+            assert!(ligero_verify(&proof, std::slice::from_ref(&delta), &params, &p));
+        }
+        assert!(
+            !saw_len_below_num_queries_ever,
+            "fix regressed: some run produced fewer than num_queries positions",
+        );
     }
 
     #[test]

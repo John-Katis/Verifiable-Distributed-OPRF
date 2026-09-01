@@ -8,7 +8,12 @@
 //! Per-phase steps (unchanged from the single-instance version):
 //!   1. Derive multiplicative subset shares `m_T` from PRG seeds.
 //!   2. Local exponentiation: `m'_T = m_T^e` wrapped as degenerate encoding.
-//!   3. Binary-tree multiplication (layer 1 = DegMul, layer 2+ = RSS.Mul).
+//!   3. Sequential Π_DegMul fold: `⟦q_1⟧ = ⟨M_{T_1}⟩`, then
+//!      `⟦q_j⟧ = ⟦q_{j-1}⟧ · ⟨M_{T_j}⟩` for `j = 2..N`. Every step's right
+//!      operand is a degenerate encoding, so every step is a `Π_DegMul`
+//!      (full-RSS × degenerate → full-RSS) — full `Π_RSS.Mul` is never
+//!      invoked, unlike the binary-tree fan-in `pub_base_exp_semi_honest`
+//!      uses for Π_exp's degenerate-encoding aggregation.
 //!
 //! All `MulRecord`s from every phase are collected and fed into one call
 //! to `dzkp_compute_batch` at the end.

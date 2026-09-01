@@ -22,8 +22,12 @@
 //!   require. Outputs per-server RSS shares of
 //!   `(d^{(γ)}_i, a_i^{(1)}, b_i^{(1)}, σ_i, c_i)` (5-Online.tex:313).
 //!
-//! - [`vip_parallel`] — `Π_VIP^Prl`. Runs `n` `vip_single` instances under
-//!   one shared transcript so all instances see the same `(r_k, ε_k)`.
+//! - [`vip_parallel`] — `Π_VIP^Prl`. Draws every F_coin challenge
+//!   `(r_k, ε_k, ε'_i, ρ)` via a genuine coin toss (`coin_toss`, PRF-keyed
+//!   RSS shares + open) *before* running any `vip_single` instance, so all
+//!   n instances see the same values. Per the paper's Appendix L, the
+//!   Fiat–Shamir transform does not apply to this batched protocol — these
+//!   challenges must stay real coin tosses, not transcript hashes.
 //!   Aggregates `c = Σ c_i` and `Σ = Σ ε'_i · σ_i` locally, then runs the
 //!   §5.1 batched triple verification (5-Online.tex:702/728, currently in
 //!   `\if0` in the rendered paper but treated as the target spec): `U(x),
@@ -42,12 +46,11 @@
 
 use num_bigint::BigUint;
 use vdoprf_crypto::hash::{hash_bytes, hash_field_elements};
-use vdoprf_crypto::transcript::Transcript;
 use vdoprf_field::Fp;
 use vdoprf_network::{CommStats, SimulatedNetwork};
-use vdoprf_offline::double_rand::generate_double_sharing;
+use vdoprf_offline::double_rand::{generate_double_sharing, generate_rss_random};
 use vdoprf_offline::rss_mul::rss_mul_batched_all_parties_with_record;
-use vdoprf_offline::rss_share::charge_rss_share_p2p;
+use vdoprf_offline::rss_share::{charge_f_coin_batch, charge_rss_share_p2p};
 use vdoprf_offline::PreSharedMaterial;
 use std::collections::BTreeMap;
 use vdoprf_ss::{
@@ -60,6 +63,31 @@ use vdoprf_ss::{
 pub enum VipResult {
     Accept,
     Abort,
+}
+
+/// Realize a single F_coin output: an unbiased field element that no
+/// minority of corrupt parties can influence or predict before it is
+/// opened. Each party independently derives its own PRF-keyed RSS share of
+/// the same secret value (no communication needed — deterministic given
+/// `pre_shared` and `counter`), then the shares are opened by
+/// reconstruction. This is the standard "generate from correlated
+/// randomness, then open" F_coin realization for an honest-majority RSS
+/// setting, and is required here: the paper (Appendix L, after Protocol 19)
+/// states the Fiat–Shamir transform is *not* applicable to the batched VIP
+/// protocol (`vip_parallel`), and that "FCoin at the last step in Π_VIP
+/// must be called" as a genuine coin toss, not a transcript hash. Mirrors
+/// `generate_double_sharing`'s existing use in this file for the `(a₀, b₀)`
+/// output-randomization values, minus the unneeded additive-share half.
+fn coin_toss(
+    counter: u64,
+    pre_shared: &[PreSharedMaterial],
+    family: &SubsetFamily,
+    modulus: &BigUint,
+) -> Fp {
+    let shares: Vec<RssShare> = (0..family.n)
+        .map(|i| generate_rss_random(i, counter, &pre_shared[i], family, modulus))
+        .collect();
+    ReplicatedSharing::reconstruct_from_party_shares(&shares, modulus)
 }
 
 /// Per-server RSS shares of the five values output by Π_VIP.
@@ -131,16 +159,18 @@ pub struct VipParallelOutput {
 /// (shares), not an *open* (reconstruction); Π_VIP^Prl never publicly
 /// reconstructs q(·), a^{(1)}, b^{(1)} between servers (`5-Online.tex:280`).
 ///
-/// `r_ks` is the pre-derived FS sequence `(r_k)_{k∈[γ]}` — shared across all n
-/// instances when invoked from `vip_parallel` to match
+/// `r_ks` is the pre-derived F_coin sequence `(r_k)_{k∈[γ]}` — shared across
+/// all n instances when invoked from `vip_parallel` to match
 /// `fig:vip_parallel_protocol` ("All instances share the same outputs r_k of
 /// F_Coin"). The caller pads inputs to a common `padded_len` (a power of two)
-/// so γ is the same for every instance. The σ-update coefficients ε_2..ε_γ
-/// are NOT drawn here; per `5-Online.tex:169` they must be sampled fresh from
-/// `F_coin` only after the loop completes. `vip_single` therefore stashes the
-/// per-round `(d, q(1), q(2))` triples in `VipBundle::sigma_stash`, and
-/// `vip_parallel` does the post-loop PRG draw + batched σ-update across all
-/// bundles.
+/// so γ is the same for every instance. `eps_sigma` is the pre-derived
+/// F_coin sequence `(ε_k)_{k=2..γ}` (length γ-1) for the Protocol 4 step 14
+/// σ-update — also shared across all n instances, drawn once by the caller
+/// via genuine F_coin (`coin_toss`), *not* sampled locally: per Appendix L
+/// the Fiat–Shamir transform does not apply here, and per the note after
+/// Protocol 19, "FCoin at the last step in Π_VIP must be called" as a real
+/// coin toss. `vip_single` stashes the per-round `(d, q(1), q(2))` triples
+/// and applies the σ-update using the caller-supplied `eps_sigma` directly.
 ///
 /// `net` is shared with sibling instances; all prover p2p sends land on the
 /// same `SimulatedNetwork.current_round`.
@@ -152,6 +182,7 @@ pub fn vip_single(
     pair_targets: &[(SubsetT, SubsetT)],
     padded_len: usize,
     r_ks: &[Fp],
+    eps_sigma: &[Fp],
     family: &SubsetFamily,
     modulus: &BigUint,
     net: &mut SimulatedNetwork,
@@ -174,6 +205,11 @@ pub fn vip_single(
         r_ks.len(),
         expected_gamma,
         "r_k sequence length must match γ = log2(padded_len)",
+    );
+    assert_eq!(
+        eps_sigma.len(),
+        expected_gamma.saturating_sub(1),
+        "eps_sigma length must match γ-1 (one per stashed round k=2..γ)",
     );
 
     // Plaintext side (prover-known): used to compute q(1), q(2), q(3) per
@@ -312,18 +348,17 @@ pub fn vip_single(
 
     // Protocol 4 step 14 (5-Online.tex:169): F_coin → ε_2..ε_γ, then
     //   σ_i ← σ_i + Σ_{k=2..γ} ε_k · (d^(k)_i − q^(k)(1)_i − q^(k)(2)_i)
-    // ε's are sampled fresh from the PRG (NOT the FS transcript) per the
-    // user's spec read. ε_k does not need to be shared across the n parallel
-    // instances of Π_VIP^Prl — only the aggregate Σ = Σ ε'_i · σ_i (drawn from
-    // the shared transcript in `vip_parallel`) is opened, and each σ_i = 0
-    // under honest exec regardless of which ε_k each prover drew locally.
-    for (d_sh, q1_ps, q2_ps) in &sigma_stash {
-        let eps = Fp::random(modulus, &mut rng);
+    // `eps_sigma` is supplied by the caller (`vip_parallel`), drawn once via
+    // genuine F_coin (`coin_toss`) and shared identically across all n
+    // parallel Π_VIP instances — matching `fig:vip_parallel_protocol` line
+    // 197 ("all instances share the same outputs (r_k, ε_k)"). Per Appendix
+    // L this must stay a real coin toss, not a Fiat-Shamir transcript value.
+    for ((d_sh, q1_ps, q2_ps), eps) in sigma_stash.iter().zip(eps_sigma.iter()) {
         for i in 0..n {
             let mut term = d_sh[i].clone();
             term.local_sub_assign(&q1_ps[i]);
             term.local_sub_assign(&q2_ps[i]);
-            term.local_scalar_mul_assign(&eps);
+            term.local_scalar_mul_assign(eps);
             sigma_shares[i].local_add_assign(&term);
         }
     }
@@ -427,8 +462,9 @@ fn build_residual_shares_from_targets(
 /// `\if0` in the rendered paper but treated as the target spec per user
 /// direction).
 ///
-/// Runs `n` instances of `vip_single` in parallel under a shared transcript,
-/// then σ-batches and runs the §5.1 triple-verification: U, V of degree n−1
+/// Runs `n` instances of `vip_single` in parallel under a shared set of
+/// genuine F_coin challenges (`coin_toss`), then σ-batches and runs the
+/// §5.1 triple-verification: U, V of degree n−1
 /// through `{(i, f_1^{(i)}(r))}_{i∈[n]}` with W computed at
 /// `j ∈ {n+1, ..., 2n−1}` (n−1 multiplications batched into 2 rounds).
 /// Removes the prior `(a₀, b₀)` randomization since `f₁(r), f₂(r)` are
@@ -439,7 +475,6 @@ pub fn vip_parallel(
     per_prover_targets: &[Vec<(SubsetT, SubsetT)>],
     family: &SubsetFamily,
     modulus: &BigUint,
-    transcript: &mut Transcript,
     pre_shared: &[PreSharedMaterial],
     rand_counter: &mut u64,
 ) -> (VipParallelOutput, CommStats) {
@@ -454,20 +489,10 @@ pub fn vip_parallel(
         assert_eq!(pp.len(), pt.len());
     }
 
-    // Phase 1: n parallel `vip_single` invocations, all drawing from a
-    // shared FS challenge sequence. Per `fig:vip_parallel_protocol` line
-    // 197, all n instances must see the same r_k_{k∈[γ]}. We materialise
-    // them here from the shared transcript *before* any prover appends its
-    // own q values, and pass them to each `vip_single`.
-    //
     // γ is the common fold depth: `next_pow2` is derived from the max pair
     // count across all provers (balanced Λ can give slightly different
     // |Λ_i|; padding to a common length keeps the challenge sequence the
     // same for every instance).
-    //
-    // The σ-update coefficients ε_2..ε_γ are NOT drawn here. Per
-    // 5-Online.tex:169 they are sampled fresh from F_coin (PRG) only after
-    // the loop completes — see the post-loop block below.
     let max_len = per_prover_pairs
         .iter()
         .map(|p| p.len())
@@ -476,15 +501,48 @@ pub fn vip_parallel(
     let padded_len = max_len.next_power_of_two().max(2);
     let gamma = (padded_len as f64).log2().ceil() as usize;
 
-    let mut r_ks: Vec<Fp> = Vec::with_capacity(gamma);
-    for _ in 0..gamma {
-        transcript.append_bytes(b"r_k");
-        r_ks.push(transcript.challenge(modulus));
-    }
+    // Draw every F_coin challenge Π_VIP^Prl needs *before* running any
+    // `vip_single` instance. Per Appendix L, the Fiat–Shamir transform is
+    // not applicable to the batched VIP protocol, so every one of these
+    // must be a genuine coin toss (`coin_toss`) rather than a transcript
+    // hash — and since a genuine coin toss (unlike Fiat-Shamir) never
+    // depends on committed prover data, there is no ordering requirement
+    // forcing us to interleave these draws with the fold rounds, and no
+    // dependency between draws either. All of `r_k`/`ε_2..ε_γ`/`ε'_i`/`ρ`
+    // are therefore requested — and opened — in a single synchronous
+    // round via `charge_f_coin_batch`, exactly as Appendix M's round
+    // accounting assumes ("FCoin to generate ε'_1,...,ε'_n can be
+    // simultaneously called with FCoin at the last step of the single VIP
+    // protocol"): one `r_Coin` round total, not one round per value.
+    let r_ks: Vec<Fp> = (0..gamma)
+        .map(|k| coin_toss(*rand_counter + k as u64, pre_shared, family, modulus))
+        .collect();
+    *rand_counter += gamma as u64;
 
-    // n parallel `vip_single` invocations on the shared `vip_net`. Every
-    // prover's FS-batched VSS sends land on `current_round = 0` — one
-    // synchronous round regardless of n or γ.
+    // ε_2..ε_γ: Protocol 4 step 14, shared across all n instances.
+    let eps_sigma: Vec<Fp> = (0..gamma.saturating_sub(1))
+        .map(|k| coin_toss(*rand_counter + k as u64, pre_shared, family, modulus))
+        .collect();
+    *rand_counter += eps_sigma.len() as u64;
+
+    // ε'_i: Protocol 5 step 4 — the Σ-batch coefficients.
+    let eps: Vec<Fp> = (0..n)
+        .map(|i| coin_toss(*rand_counter + i as u64, pre_shared, family, modulus))
+        .collect();
+    *rand_counter += n as u64;
+
+    // ρ: Protocol 5 step 11.
+    let rho = coin_toss(*rand_counter, pre_shared, family, modulus);
+    *rand_counter += 1;
+
+    let total_coins = gamma + eps_sigma.len() + n + 1;
+    let mut coin_net = SimulatedNetwork::new(n);
+    charge_f_coin_batch(&mut coin_net, family, modulus, total_coins);
+    let coin_comm = coin_net.stats();
+
+    // Phase 1: n parallel `vip_single` invocations, all using the shared
+    // (r_k, ε_sigma) coin-toss outputs above. Every prover's VSS sends land
+    // on `current_round = 0` — one synchronous round regardless of n or γ.
     let mut vip_net = SimulatedNetwork::new(n);
     let mut bundles: Vec<VipBundle> = Vec::with_capacity(n);
     for prover in 0..n {
@@ -495,22 +553,13 @@ pub fn vip_parallel(
             &per_prover_targets[prover],
             padded_len,
             &r_ks,
+            &eps_sigma,
             family,
             modulus,
             &mut vip_net,
         );
         bundles.push(bundle);
     }
-    // Π_VIP^Prl invokes one F_coin to draw the σ-update ε's shared across all
-    // n parallel Π_VIP instances (5-Online.tex:169, 190). The per-iter rng
-    // draws inside `vip_single` realise this F_coin's vector output locally;
-    // here we charge its protocol-level network cost — one round + the
-    // RSS.Open of [r] (n · N' · feb bytes broadcast).
-    vdoprf_offline::rss_share::charge_f_coin(&mut vip_net, family, modulus);
-
-    // σ_i is already finalised inside each `vip_single` (Protocol 4 step 14
-    // PRG-drawn ε_2..ε_γ; per-prover-local — no shared draw needed since
-    // each σ_i = 0 under honest exec independently of the chosen ε_k).
 
     // Aggregated c = Σ_i c_i (local).
     let c_shares: Vec<RssShare> = (0..n)
@@ -523,16 +572,10 @@ pub fn vip_parallel(
         })
         .collect();
 
-    // Σ-batch: ε'_i drawn from F_coin (PRG), Σ = Σ ε'_i · σ_i (local).
-    // Mirrors the per-iter F_coin realisation in `vip_single` — values are
-    // sampled fresh from `rand::thread_rng()`; the protocol-level cost is
-    // charged on `vip_net` below (one round + n · N' · feb bytes).
-    let mut sigma_batch_rng = rand::thread_rng();
-    let eps: Vec<Fp> = (0..n)
-        .map(|_| Fp::random(modulus, &mut sigma_batch_rng))
-        .collect();
-    vdoprf_offline::rss_share::charge_f_coin(&mut vip_net, family, modulus);
     let mut comm = vip_net.stats();
+    comm.merge(&coin_comm);
+
+    // Σ-batch: Σ = Σ ε'_i · σ_i (local), using the F_coin-drawn ε' above.
     let sigma_shares: Vec<RssShare> = (0..n)
         .map(|s| {
             let mut acc = bundles[0].sigma[s].local_scalar_mul(&eps[0]);
@@ -610,9 +653,9 @@ pub fn vip_parallel(
     };
     comm.merge(&mul_comm);
 
-    // ρ challenge ∉ {1, …, 2n−1}. Cryptographic prime → negligible collision.
-    transcript.append_bytes(b"rho");
-    let rho = transcript.challenge(modulus);
+    // ρ (∉ {1, …, 2n−1} with overwhelming probability — cryptographic prime
+    // → negligible collision) was drawn above via genuine F_coin, before any
+    // `vip_single` instance ran.
 
     // Build the 2n−1 known points for W(x): W(i) = d_i for i ∈ {1..n}, plus
     // W(j) computed for j ∈ {n+1, …, 2n−1}. W has degree 2(n−1).
@@ -802,14 +845,12 @@ mod tests {
             per_prover_targets.push(targets);
         }
 
-        let mut transcript = Transcript::new(b"vip_parallel.test");
         let mut rand_counter = 50_000u64;
         let (out, _comm) = vip_parallel(
             &per_prover_pairs,
             &per_prover_targets,
             &family,
             &modulus,
-            &mut transcript,
             &pre_shared,
             &mut rand_counter,
         );
@@ -881,24 +922,30 @@ mod tests {
             .collect()
     }
 
-    /// Test helper: derive a γ-long r_k sequence for single-prover Π_VIP
-    /// using a fresh transcript. Mirrors what `vip_parallel` does for the
-    /// shared sequence, just applied to one prover for unit tests. The
-    /// per-prover ε_2..ε_γ σ-update coefficients are drawn fresh from PRG
-    /// inside `vip_single` itself (Protocol 4 step 14).
-    fn derive_r_ks_for_len(
+    /// Test helper: derive a γ-long r_k sequence plus the γ-1 eps_sigma
+    /// sequence for single-prover Π_VIP via genuine F_coin (`coin_toss`),
+    /// mirroring exactly what `vip_parallel` does for the shared sequence,
+    /// just applied standalone for unit tests.
+    fn derive_round_coins(
         pairs_len: usize,
-        transcript: &mut Transcript,
+        counter: &mut u64,
+        pre_shared: &[PreSharedMaterial],
+        family: &SubsetFamily,
         modulus: &BigUint,
-    ) -> (usize, Vec<Fp>) {
+    ) -> (usize, Vec<Fp>, Vec<Fp>) {
         let padded_len = pairs_len.next_power_of_two().max(2);
         let gamma = (padded_len as f64).log2() as usize;
         let mut r_ks = Vec::with_capacity(gamma);
         for _ in 0..gamma {
-            transcript.append_bytes(b"r_k");
-            r_ks.push(transcript.challenge(modulus));
+            r_ks.push(coin_toss(*counter, pre_shared, family, modulus));
+            *counter += 1;
         }
-        (padded_len, r_ks)
+        let mut eps_sigma = Vec::with_capacity(gamma.saturating_sub(1));
+        for _ in 0..gamma.saturating_sub(1) {
+            eps_sigma.push(coin_toss(*counter, pre_shared, family, modulus));
+            *counter += 1;
+        }
+        (padded_len, r_ks, eps_sigma)
     }
 
     /// Per-prover pair lists with a non-trivial per-prover inner product.
@@ -945,18 +992,19 @@ mod tests {
     /// §4-Online line 151 / 170: c_i = Σ_{ℓ∈[L]} a_i^{(ℓ)}·b_i^{(ℓ)}.
     #[test]
     fn vip_single_c_equals_inner_product() {
-        let (n, _t, modulus, family, _ps) = small_setup();
+        let (n, _t, modulus, family, pre_shared) = small_setup();
         let pairs = make_pairs(&modulus, &[(3, 5), (7, 11), (13, 17)]);
         let mut expected = Fp::zero(&modulus);
         for (a, b) in &pairs {
             expected = &expected + &(a * b);
         }
 
-        let mut tr = Transcript::new(b"vip_single_c");
         let mut net = SimulatedNetwork::new(n);
-        let (padded_len, r_ks) = derive_r_ks_for_len(pairs.len(), &mut tr, &modulus);
+        let mut counter = 10_000u64;
+        let (padded_len, r_ks, eps_sigma) =
+            derive_round_coins(pairs.len(), &mut counter, &pre_shared, &family, &modulus);
         let pair_targets = targets_for_test_pairs(&pairs, &family);
-        let out = vip_single(0, n, &pairs, &pair_targets, padded_len, &r_ks, &family, &modulus, &mut net);
+        let out = vip_single(0, n, &pairs, &pair_targets, padded_len, &r_ks, &eps_sigma, &family, &modulus, &mut net);
 
         assert_eq!(reconstruct(&out.c, &modulus).value, expected.value);
     }
@@ -965,14 +1013,15 @@ mod tests {
     /// satisfies d_i = a_i^{(1)}·b_i^{(1)} (the "compression" property).
     #[test]
     fn vip_single_d_equals_a1_times_b1_after_compression() {
-        let (n, _t, modulus, family, _ps) = small_setup();
+        let (n, _t, modulus, family, pre_shared) = small_setup();
         let pairs = make_pairs(&modulus, &[(2, 3), (5, 7), (11, 13), (17, 19)]);
 
-        let mut tr = Transcript::new(b"vip_single_compression");
         let mut net = SimulatedNetwork::new(n);
-        let (padded_len, r_ks) = derive_r_ks_for_len(pairs.len(), &mut tr, &modulus);
+        let mut counter = 11_000u64;
+        let (padded_len, r_ks, eps_sigma) =
+            derive_round_coins(pairs.len(), &mut counter, &pre_shared, &family, &modulus);
         let pair_targets = targets_for_test_pairs(&pairs, &family);
-        let out = vip_single(0, n, &pairs, &pair_targets, padded_len, &r_ks, &family, &modulus, &mut net);
+        let out = vip_single(0, n, &pairs, &pair_targets, padded_len, &r_ks, &eps_sigma, &family, &modulus, &mut net);
 
         let d = reconstruct(&out.d, &modulus);
         let a1 = reconstruct(&out.a1, &modulus);
@@ -984,14 +1033,15 @@ mod tests {
     /// (d − q(1) − q(2)) telescoping check accumulates to zero.
     #[test]
     fn vip_single_sigma_is_zero_when_honest() {
-        let (n, _t, modulus, family, _ps) = small_setup();
+        let (n, _t, modulus, family, pre_shared) = small_setup();
         let pairs = make_pairs(&modulus, &[(2, 3), (5, 7), (11, 13)]);
 
-        let mut tr = Transcript::new(b"vip_single_sigma");
         let mut net = SimulatedNetwork::new(n);
-        let (padded_len, r_ks) = derive_r_ks_for_len(pairs.len(), &mut tr, &modulus);
+        let mut counter = 12_000u64;
+        let (padded_len, r_ks, eps_sigma) =
+            derive_round_coins(pairs.len(), &mut counter, &pre_shared, &family, &modulus);
         let pair_targets = targets_for_test_pairs(&pairs, &family);
-        let out = vip_single(0, n, &pairs, &pair_targets, padded_len, &r_ks, &family, &modulus, &mut net);
+        let out = vip_single(0, n, &pairs, &pair_targets, padded_len, &r_ks, &eps_sigma, &family, &modulus, &mut net);
 
         assert!(reconstruct(&out.sigma, &modulus).is_zero());
     }
@@ -1000,13 +1050,14 @@ mod tests {
     /// (d_i, a_i^{(1)}, b_i^{(1)}, σ_i, c_i), with one RSS share per server.
     #[test]
     fn vip_single_output_is_five_rss_per_server() {
-        let (n, _t, modulus, family, _ps) = small_setup();
+        let (n, _t, modulus, family, pre_shared) = small_setup();
         let pairs = make_pairs(&modulus, &[(1, 2), (3, 4)]);
-        let mut tr = Transcript::new(b"vip_single_shape");
         let mut net = SimulatedNetwork::new(n);
-        let (padded_len, r_ks) = derive_r_ks_for_len(pairs.len(), &mut tr, &modulus);
+        let mut counter = 13_000u64;
+        let (padded_len, r_ks, eps_sigma) =
+            derive_round_coins(pairs.len(), &mut counter, &pre_shared, &family, &modulus);
         let pair_targets = targets_for_test_pairs(&pairs, &family);
-        let out = vip_single(0, n, &pairs, &pair_targets, padded_len, &r_ks, &family, &modulus, &mut net);
+        let out = vip_single(0, n, &pairs, &pair_targets, padded_len, &r_ks, &eps_sigma, &family, &modulus, &mut net);
 
         assert_eq!(out.d.len(), n);
         assert_eq!(out.a1.len(), n);
@@ -1019,14 +1070,15 @@ mod tests {
     /// Edge case L=1 (padded to 2). c = a·b, d = a^{(1)}·b^{(1)}, σ = 0 still.
     #[test]
     fn vip_single_l_equals_one() {
-        let (n, _t, modulus, family, _ps) = small_setup();
+        let (n, _t, modulus, family, pre_shared) = small_setup();
         let pairs = make_pairs(&modulus, &[(19, 23)]);
 
-        let mut tr = Transcript::new(b"vip_single_l1");
         let mut net = SimulatedNetwork::new(n);
-        let (padded_len, r_ks) = derive_r_ks_for_len(pairs.len(), &mut tr, &modulus);
+        let mut counter = 14_000u64;
+        let (padded_len, r_ks, eps_sigma) =
+            derive_round_coins(pairs.len(), &mut counter, &pre_shared, &family, &modulus);
         let pair_targets = targets_for_test_pairs(&pairs, &family);
-        let out = vip_single(0, n, &pairs, &pair_targets, padded_len, &r_ks, &family, &modulus, &mut net);
+        let out = vip_single(0, n, &pairs, &pair_targets, padded_len, &r_ks, &eps_sigma, &family, &modulus, &mut net);
 
         assert_eq!(
             reconstruct(&out.c, &modulus).value,
@@ -1042,18 +1094,19 @@ mod tests {
     /// Non-power-of-two L (padded with (0,0)). All three invariants still hold.
     #[test]
     fn vip_single_non_power_of_two_l() {
-        let (n, _t, modulus, family, _ps) = small_setup();
+        let (n, _t, modulus, family, pre_shared) = small_setup();
         let pairs = make_pairs(&modulus, &[(1, 2), (3, 4), (5, 6)]); // L=3 pads to 4
         let mut expected = Fp::zero(&modulus);
         for (a, b) in &pairs {
             expected = &expected + &(a * b);
         }
 
-        let mut tr = Transcript::new(b"vip_single_l3");
         let mut net = SimulatedNetwork::new(n);
-        let (padded_len, r_ks) = derive_r_ks_for_len(pairs.len(), &mut tr, &modulus);
+        let mut counter = 15_000u64;
+        let (padded_len, r_ks, eps_sigma) =
+            derive_round_coins(pairs.len(), &mut counter, &pre_shared, &family, &modulus);
         let pair_targets = targets_for_test_pairs(&pairs, &family);
-        let out = vip_single(0, n, &pairs, &pair_targets, padded_len, &r_ks, &family, &modulus, &mut net);
+        let out = vip_single(0, n, &pairs, &pair_targets, padded_len, &r_ks, &eps_sigma, &family, &modulus, &mut net);
 
         assert_eq!(reconstruct(&out.c, &modulus).value, expected.value);
         let d = reconstruct(&out.d, &modulus);
@@ -1066,7 +1119,7 @@ mod tests {
     /// Larger L (= 8 ⇒ γ = 3 iterations). Invariants hold across multi-fold.
     #[test]
     fn vip_single_larger_l() {
-        let (n, _t, modulus, family, _ps) = small_setup();
+        let (n, _t, modulus, family, pre_shared) = small_setup();
         let pairs: Vec<(Fp, Fp)> = (1..=8u32)
             .map(|k| {
                 (
@@ -1080,11 +1133,12 @@ mod tests {
             expected = &expected + &(a * b);
         }
 
-        let mut tr = Transcript::new(b"vip_single_l8");
         let mut net = SimulatedNetwork::new(n);
-        let (padded_len, r_ks) = derive_r_ks_for_len(pairs.len(), &mut tr, &modulus);
+        let mut counter = 16_000u64;
+        let (padded_len, r_ks, eps_sigma) =
+            derive_round_coins(pairs.len(), &mut counter, &pre_shared, &family, &modulus);
         let pair_targets = targets_for_test_pairs(&pairs, &family);
-        let out = vip_single(0, n, &pairs, &pair_targets, padded_len, &r_ks, &family, &modulus, &mut net);
+        let out = vip_single(0, n, &pairs, &pair_targets, padded_len, &r_ks, &eps_sigma, &family, &modulus, &mut net);
 
         assert_eq!(reconstruct(&out.c, &modulus).value, expected.value);
         let d = reconstruct(&out.d, &modulus);
@@ -1109,10 +1163,9 @@ mod tests {
             }
         }
 
-        let mut tr = Transcript::new(b"vip_parallel_c_sum");
         let mut counter = 1_000u64;
         let (out, _) =
-            vip_parallel(&per, &per_targets, &family, &modulus, &mut tr, &pre_shared, &mut counter);
+            vip_parallel(&per, &per_targets, &family, &modulus, &pre_shared, &mut counter);
 
         assert_eq!(ReplicatedSharing::reconstruct_from_party_shares(&out.c_shares, &modulus).value, expected.value);
     }
@@ -1125,10 +1178,9 @@ mod tests {
         let per = make_parallel_pairs(n, &family, &modulus);
         let per_targets = parallel_targets_for_test_pairs(&per, &family);
 
-        let mut tr = Transcript::new(b"vip_parallel_sigma");
         let mut counter = 2_000u64;
         let (out, _) =
-            vip_parallel(&per, &per_targets, &family, &modulus, &mut tr, &pre_shared, &mut counter);
+            vip_parallel(&per, &per_targets, &family, &modulus, &pre_shared, &mut counter);
 
         assert!(ReplicatedSharing::reconstruct_from_party_shares(&out.sigma_shares, &modulus).is_zero());
     }
@@ -1142,10 +1194,9 @@ mod tests {
         let per = make_parallel_pairs(n, &family, &modulus);
         let per_targets = parallel_targets_for_test_pairs(&per, &family);
 
-        let mut tr = Transcript::new(b"vip_parallel_triple");
         let mut counter = 3_000u64;
         let (out, _) =
-            vip_parallel(&per, &per_targets, &family, &modulus, &mut tr, &pre_shared, &mut counter);
+            vip_parallel(&per, &per_targets, &family, &modulus, &pre_shared, &mut counter);
 
         let w = ReplicatedSharing::reconstruct_from_party_shares(&out.w_rho_shares, &modulus);
         let u = ReplicatedSharing::reconstruct_from_party_shares(&out.u_rho_shares, &modulus);
@@ -1161,10 +1212,9 @@ mod tests {
         let per = make_parallel_pairs(n, &family, &modulus);
         let per_targets = parallel_targets_for_test_pairs(&per, &family);
 
-        let mut tr = Transcript::new(b"vip_parallel_shape");
         let mut counter = 4_000u64;
         let (out, _) =
-            vip_parallel(&per, &per_targets, &family, &modulus, &mut tr, &pre_shared, &mut counter);
+            vip_parallel(&per, &per_targets, &family, &modulus, &pre_shared, &mut counter);
 
         assert_eq!(out.w_rho_shares.len(), n);
         assert_eq!(out.u_rho_shares.len(), n);
@@ -1174,10 +1224,11 @@ mod tests {
     }
 
     /// §4-Online lines 192-193: "all instances share the same F_Coin outputs
-    /// (r_k, ε_k)". Consequence: given the same pairs, transcript domain,
-    /// pre-shared material, and F_Rand counter, the reconstructed plaintexts
-    /// (W(ρ), U(ρ), V(ρ), Σ, c) are fully determined. The per-share RSS
-    /// randomness varies across runs, but the opened values agree.
+    /// (r_k, ε_k)". Consequence: given the same pairs, pre-shared material,
+    /// and starting counter, the reconstructed plaintexts (W(ρ), U(ρ), V(ρ),
+    /// Σ, c) are fully determined (`coin_toss` is a pure function of
+    /// `(counter, pre_shared)`). The per-share RSS randomness varies across
+    /// runs, but the opened values agree.
     #[test]
     fn vip_parallel_reconstructions_determined_by_transcript_and_inputs() {
         let (n, _t, modulus, family, pre_shared) = small_setup();
@@ -1185,9 +1236,8 @@ mod tests {
         let per_targets = parallel_targets_for_test_pairs(&per, &family);
 
         let run = || {
-            let mut tr = Transcript::new(b"vip_parallel_determinism");
             let mut counter = 42u64;
-            vip_parallel(&per, &per_targets, &family, &modulus, &mut tr, &pre_shared, &mut counter).0
+            vip_parallel(&per, &per_targets, &family, &modulus, &pre_shared, &mut counter).0
         };
         let a = run();
         let b = run();
@@ -1215,10 +1265,9 @@ mod tests {
         let per = make_parallel_pairs(n, &family, &modulus);
         let per_targets = parallel_targets_for_test_pairs(&per, &family);
 
-        let mut tr = Transcript::new(b"cv_accept");
         let mut counter = 5_000u64;
         let (out, _) =
-            vip_parallel(&per, &per_targets, &family, &modulus, &mut tr, &pre_shared, &mut counter);
+            vip_parallel(&per, &per_targets, &family, &modulus, &pre_shared, &mut counter);
 
         assert_eq!(client_verify_vip_parallel(&out, &modulus), VipResult::Accept);
     }
@@ -1230,10 +1279,9 @@ mod tests {
         let per = make_parallel_pairs(n, &family, &modulus);
         let per_targets = parallel_targets_for_test_pairs(&per, &family);
 
-        let mut tr = Transcript::new(b"cv_w");
         let mut counter = 6_000u64;
         let (mut out, _) =
-            vip_parallel(&per, &per_targets, &family, &modulus, &mut tr, &pre_shared, &mut counter);
+            vip_parallel(&per, &per_targets, &family, &modulus, &pre_shared, &mut counter);
 
         bump_party0_add(&mut out.w_rho_shares, &modulus);
         assert_eq!(client_verify_vip_parallel(&out, &modulus), VipResult::Abort);
@@ -1246,10 +1294,9 @@ mod tests {
         let per = make_parallel_pairs(n, &family, &modulus);
         let per_targets = parallel_targets_for_test_pairs(&per, &family);
 
-        let mut tr = Transcript::new(b"cv_u");
         let mut counter = 7_000u64;
         let (mut out, _) =
-            vip_parallel(&per, &per_targets, &family, &modulus, &mut tr, &pre_shared, &mut counter);
+            vip_parallel(&per, &per_targets, &family, &modulus, &pre_shared, &mut counter);
 
         bump_party0_add(&mut out.u_rho_shares, &modulus);
         assert_eq!(client_verify_vip_parallel(&out, &modulus), VipResult::Abort);
@@ -1262,10 +1309,9 @@ mod tests {
         let per = make_parallel_pairs(n, &family, &modulus);
         let per_targets = parallel_targets_for_test_pairs(&per, &family);
 
-        let mut tr = Transcript::new(b"cv_v");
         let mut counter = 8_000u64;
         let (mut out, _) =
-            vip_parallel(&per, &per_targets, &family, &modulus, &mut tr, &pre_shared, &mut counter);
+            vip_parallel(&per, &per_targets, &family, &modulus, &pre_shared, &mut counter);
 
         bump_party0_add(&mut out.v_rho_shares, &modulus);
         assert_eq!(client_verify_vip_parallel(&out, &modulus), VipResult::Abort);
@@ -1278,12 +1324,106 @@ mod tests {
         let per = make_parallel_pairs(n, &family, &modulus);
         let per_targets = parallel_targets_for_test_pairs(&per, &family);
 
-        let mut tr = Transcript::new(b"cv_sigma");
         let mut counter = 9_000u64;
         let (mut out, _) =
-            vip_parallel(&per, &per_targets, &family, &modulus, &mut tr, &pre_shared, &mut counter);
+            vip_parallel(&per, &per_targets, &family, &modulus, &pre_shared, &mut counter);
 
         bump_party0_add(&mut out.sigma_shares, &modulus);
         assert_eq!(client_verify_vip_parallel(&out, &modulus), VipResult::Abort);
+    }
+
+    // ---- Genuine F_coin realization (regression coverage for the
+    // identical-r_k / thread_rng bugs this module used to have) ----
+
+    /// The old `r_ks` derivation appended the same constant label
+    /// (`b"r_k"`) every loop iteration and called `Transcript::challenge`
+    /// (which does not mutate the hasher), so every `r_k` in the sequence
+    /// came out bit-identical. `coin_toss` with a distinct counter per round
+    /// must not reproduce that bug.
+    #[test]
+    fn coin_toss_r_ks_are_pairwise_distinct_across_rounds() {
+        let (_n, _t, modulus, family, pre_shared) = small_setup();
+        let mut counter = 20_000u64;
+        let (_padded_len, r_ks, _eps_sigma) =
+            derive_round_coins(5, &mut counter, &pre_shared, &family, &modulus);
+        assert!(r_ks.len() >= 2, "test needs γ ≥ 2 to check pairwise distinctness");
+        for i in 0..r_ks.len() {
+            for j in (i + 1)..r_ks.len() {
+                assert_ne!(
+                    r_ks[i].value, r_ks[j].value,
+                    "r_ks[{i}] and r_ks[{j}] must differ — each round must draw an independent F_coin value",
+                );
+            }
+        }
+    }
+
+    /// `coin_toss` is a pure, deterministic function of `(counter,
+    /// pre_shared)` — same counter reproduces the same value, distinct
+    /// counters (with overwhelming probability) give distinct values.
+    #[test]
+    fn coin_toss_deterministic_and_counter_separated() {
+        let (_n, _t, modulus, family, pre_shared) = small_setup();
+        let a1 = coin_toss(30_000, &pre_shared, &family, &modulus);
+        let a2 = coin_toss(30_000, &pre_shared, &family, &modulus);
+        let b = coin_toss(30_001, &pre_shared, &family, &modulus);
+        assert_eq!(a1.value, a2.value, "same counter must reproduce the same coin");
+        assert_ne!(a1.value, b.value, "distinct counters must give distinct coins");
+    }
+
+    /// All of `vip_parallel`'s F_coin draws (`r_k` per round, `ε_2..ε_γ`,
+    /// `ε'_i`, `ρ`) are opened in a single batched round
+    /// (`charge_f_coin_batch`), matching the paper's own round-complexity
+    /// accounting (Appendix M: "FCoin to generate ε'_1,...,ε'_n can be
+    /// simultaneously called with FCoin at the last step of the single VIP
+    /// protocol"). Consequently `comm.rounds` must not grow with γ = ⌈log
+    /// L⌉ — only the byte count should. Regression guard against
+    /// accidentally reverting to one `charge_f_coin` round per draw.
+    #[test]
+    fn vip_parallel_round_count_independent_of_gamma() {
+        let (n, _t, modulus, family, pre_shared) = small_setup();
+
+        // L = 2 pairs per prover ⇒ γ = 1.
+        let small_per: Vec<Vec<(Fp, Fp)>> = (0..n)
+            .map(|i| {
+                let base = (i as u32) + 1;
+                vec![
+                    (Fp::new(BigUint::from(base), &modulus), Fp::new(BigUint::from(base + 1), &modulus)),
+                    (Fp::new(BigUint::from(base + 2), &modulus), Fp::new(BigUint::from(base + 3), &modulus)),
+                ]
+            })
+            .collect();
+        let small_targets = parallel_targets_for_test_pairs(&small_per, &family);
+
+        // L = 16 pairs per prover ⇒ γ = 4 — far more coin-toss draws
+        // (r_ks alone goes from 1 to 4 values, plus 3 new ε_sigma draws),
+        // but must cost the same number of rounds.
+        let large_per: Vec<Vec<(Fp, Fp)>> = (0..n)
+            .map(|i| {
+                let base = (i as u32) * 100 + 1;
+                (0..16)
+                    .map(|k| {
+                        (
+                            Fp::new(BigUint::from(base + 2 * k), &modulus),
+                            Fp::new(BigUint::from(base + 2 * k + 1), &modulus),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        let large_targets = parallel_targets_for_test_pairs(&large_per, &family);
+
+        let mut counter_small = 40_000u64;
+        let (_, comm_small) = vip_parallel(
+            &small_per, &small_targets, &family, &modulus, &pre_shared, &mut counter_small,
+        );
+        let mut counter_large = 41_000u64;
+        let (_, comm_large) = vip_parallel(
+            &large_per, &large_targets, &family, &modulus, &pre_shared, &mut counter_large,
+        );
+
+        assert_eq!(
+            comm_small.rounds, comm_large.rounds,
+            "round count must not scale with γ once F_coin draws are batched into one round",
+        );
     }
 }

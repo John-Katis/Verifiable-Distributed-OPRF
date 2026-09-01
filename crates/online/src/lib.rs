@@ -21,6 +21,7 @@ pub mod compute;
 pub mod compute_batch;
 pub mod compute_boyle;
 pub mod compute_parallel;
+pub mod input;
 pub mod vip;
 
 use num_bigint::BigUint;
@@ -170,6 +171,13 @@ pub(crate) struct PerInputPairs {
 /// in this stage is the client→servers VSS input distribution, which the
 /// bench charges separately via `client_to_servers_input`; we return
 /// `CommStats::default()` here.
+///
+/// Unverified client-input path: the client is treated as an ad-hoc local
+/// dealer (`vdoprf_ss::share`) with no consistency check — see
+/// [`crate::input`] for the verifiable replacement (`Π_Input`, Protocol 9),
+/// used by `compute_batch::compute_batch_with_verified_input`. This
+/// function is left as-is deliberately, so `compute_batch::compute_batch`
+/// remains available as the "unverified input" comparison baseline.
 pub(crate) fn share_add_and_extract_pairs(
     xs: &[Fp],
     pre: &OnlinePreprocessed,
@@ -179,6 +187,37 @@ pub(crate) fn share_add_and_extract_pairs(
     let n = family.n;
     let mut rng = rand::thread_rng();
 
+    let x_shares_per_input: Vec<Vec<RssShare>> = xs
+        .iter()
+        .map(|x| {
+            // Client VSS-shares x_j; each server pulls its piece.
+            let x_sharing = share(x, family, modulus, &mut rng);
+            (0..n)
+                .map(|i| get_party_share(&x_sharing, i, family))
+                .collect()
+        })
+        .collect();
+
+    (
+        extract_pairs_from_x_shares(&x_shares_per_input, pre, family, modulus),
+        CommStats::default(),
+    )
+}
+
+/// Given each input's already-obtained per-party RSS shares of `x_j`
+/// (however they were produced — the unverified `share()` dealer above, or
+/// `Π_Input`'s verifiable mask-and-broadcast in [`crate::input`]), add the
+/// key and extract the per-party cross-product pairs VIP will consume.
+/// Factored out of `share_add_and_extract_pairs` so both client-input
+/// paths share this identical downstream logic.
+pub(crate) fn extract_pairs_from_x_shares(
+    x_shares_per_input: &[Vec<RssShare>],
+    pre: &OnlinePreprocessed,
+    family: &SubsetFamily,
+    _modulus: &BigUint,
+) -> Vec<PerInputPairs> {
+    let n = family.n;
+
     let k_shares: Vec<RssShare> = (0..n)
         .map(|i| get_party_share(&pre.k_sharing, i, family))
         .collect();
@@ -187,18 +226,12 @@ pub(crate) fn share_add_and_extract_pairs(
         "OnlinePreprocessed must carry at least one α^e sharing"
     );
 
-    let mut out: Vec<PerInputPairs> = Vec::with_capacity(xs.len());
+    let mut out: Vec<PerInputPairs> = Vec::with_capacity(x_shares_per_input.len());
 
-    for (j, x) in xs.iter().enumerate() {
+    for (j, x_party_shares) in x_shares_per_input.iter().enumerate() {
         let alpha_sharing = &pre.alpha_e_sharings[j % pre.alpha_e_sharings.len()];
         let alpha_party_shares: Vec<RssShare> = (0..n)
             .map(|i| get_party_share(alpha_sharing, i, family))
-            .collect();
-
-        // Client VSS-shares x_j; each server pulls its piece.
-        let x_sharing = share(x, family, modulus, &mut rng);
-        let x_party_shares: Vec<RssShare> = (0..n)
-            .map(|i| get_party_share(&x_sharing, i, family))
             .collect();
 
         // [a_j] = [x_j + k]  (local RSS addition).
@@ -239,7 +272,7 @@ pub(crate) fn share_add_and_extract_pairs(
         });
     }
 
-    (out, CommStats::default())
+    out
 }
 
 #[cfg(test)]

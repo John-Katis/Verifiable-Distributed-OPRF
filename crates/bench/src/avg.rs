@@ -153,6 +153,8 @@ mod tests {
             broadcast_bytes: bcast,
             broadcast_messages: 1,
             rounds,
+            client_bytes: 0,
+            client_messages: 0,
         }
     }
 
@@ -211,13 +213,23 @@ mod tests {
         assert_eq!(BENCH_ITERS, 10);
     }
 
-    /// Split averager sums p2p+broadcast within each axis and sums rounds
-    /// across the two axes. Constant input across iterations round-trips.
+    /// Split averager reads ss_bytes from p2p+broadcast and sc_bytes from
+    /// `client_bytes` of the SAME `CommStats` (`bench_avg_split` takes one
+    /// merged `CommStats` per iteration, not two separate ones — matching
+    /// how real call sites build it via `.merge()` before passing it in).
+    /// Constant input across iterations round-trips.
     #[test]
     fn bench_avg_split_constant() {
-        let ss = constant_stats(300, 700, 2); // ss total = 1000, ss rounds = 2
-        let sc = constant_stats(40, 60, 1); //   sc total = 100,  sc rounds = 1
-        let avg = bench_avg_split(|| (12.5, ss.clone(), sc.clone()));
+        let merged = CommStats {
+            p2p_bytes: 300,
+            p2p_messages: 1,
+            broadcast_bytes: 700, // ss total = 300 + 700 = 1000
+            broadcast_messages: 1,
+            rounds: 3, // as if two sub-networks (2 rounds + 1 round) were merged
+            client_bytes: 100, // sc total = 100
+            client_messages: 1,
+        };
+        let avg = bench_avg_split(|| (12.5, merged.clone()));
         assert!((avg.time_ms - 12.5).abs() < 1e-9);
         assert_eq!(avg.ss_bytes, 1000);
         assert_eq!(avg.sc_bytes, 100);

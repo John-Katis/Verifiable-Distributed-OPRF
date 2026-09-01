@@ -10,7 +10,11 @@
 //!     has a piece `a_T ∈ Z_{p-1}`; parties holding `a_T` locally compute
 //!     `h_T = b^{a_T} ∈ F_p`, wrap it as a `DegenerateEncoding`, and the
 //!     parties fan-in multiply all `⟨h_T⟩_T` via a `deg_mul` + `rss_mul`
-//!     binary tree (the same structure used by `approach_ii`).
+//!     binary tree (layer 0 pairs up the degenerate encodings via `deg_mul`;
+//!     layers 1+ combine two already-full-RSS results, so they fall back to
+//!     full `rss_mul_all_parties_with_record`). `approach_ii::gen_degenerate`
+//!     does NOT use this structure — it folds sequentially, keeping one
+//!     operand degenerate at every step, so it never needs a full RSS.Mul.
 //!
 //!   * `pub_base_exp_malicious` — Protocol 6. Two semi-honest calls plus a
 //!     consistency check that catches malicious parties who mis-compute a

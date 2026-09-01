@@ -4,7 +4,6 @@
 //! per-query DZKP but parallel-dispatches the m local degree-2 evaluations).
 
 use num_bigint::BigUint;
-use vdoprf_crypto::transcript::Transcript;
 use vdoprf_field::Fp;
 use vdoprf_network::CommStats;
 use vdoprf_offline::PreSharedMaterial;
@@ -30,15 +29,12 @@ pub fn compute_parallel(
     let mut client_outputs: Vec<Fp> = Vec::with_capacity(per_input.len());
     let mut parallel_comm = CommStats::default();
 
-    for (j, input) in per_input.iter().enumerate() {
-        let mut transcript = Transcript::new(b"vdoprf.online.compute_parallel");
-        transcript.append_bytes(&(j as u64).to_be_bytes());
+    for input in per_input.iter() {
         let (out, vip_comm) = vip_parallel(
             &input.party_pairs,
             &input.party_targets,
             family,
             modulus,
-            &mut transcript,
             pre_shared,
             &mut rand_counter,
         );

@@ -161,6 +161,11 @@ pub fn gen_zkp(
                         let (ref a0t, ref a1t) = proof.check_values[rep];
                         broadcast_data.extend_from_slice(&a0t.value.to_bytes_be());
                         broadcast_data.extend_from_slice(&a1t.value.to_bytes_be());
+                        // Two-level GGM commitment roots (Section 4.2.2) —
+                        // must be broadcast so every verifier can bind Δ/χ
+                        // and the input-binding check to them.
+                        broadcast_data.extend_from_slice(&proof.seed_roots[rep]);
+                        broadcast_data.extend_from_slice(&proof.hidden_leaf_roots[rep]);
                     }
                     for copath in &proof.copaths {
                         for seed in copath {
@@ -169,22 +174,72 @@ pub fn gen_zkp(
                     }
                     zkp_net.broadcast(dealer_id, broadcast_data);
 
-                    let r = params.repetitions;
-                    let log_tau = (params.tau as f64).log2().ceil() as usize;
-                    for v in 0..n {
-                        if v != dealer_id {
-                            let path_data = vec![0u8; r * log_tau * 32];
-                            zkp_net.send_p2p(dealer_id, v, path_data);
-                        }
-                    }
-
                     // Every server runs vith_verify independently in a real
                     // deployment. vith_verify is deterministic in (proof,
                     // delta, params), so all honest servers reach the same
                     // verdict. Simulate once here — the wall-clock of a single
                     // call equals the per-server CPU cost under the paper's
                     // parallelism model (all servers verify concurrently).
-                    let local_shares: BTreeMap<SubsetT, (Fp, Fp)> = BTreeMap::new();
+                    // We pick the first non-dealer party as "the" verifier
+                    // this single call stands in for.
+                    let verifier_id = (0..n).find(|&v| v != dealer_id).unwrap_or(dealer_id);
+
+                    // Step 5.5 (dual-share consistency input): the positions
+                    // this verifier holds locally are exactly the subsets in
+                    // its own RSS view that also appear in the dealer's
+                    // witness — i.e. T ∈ dealer_subsets with verifier_id ∉ T.
+                    // Reproduces the dealer's own (m_T, a_T) derivation
+                    // (same PRF, same counters, same rejection sampling)
+                    // from the verifier's independent view of the shared key.
+                    let mut local_shares: BTreeMap<usize, Fp> = BTreeMap::new();
+                    if verifier_id != dealer_id {
+                        let verifier_subsets: Vec<SubsetT> = family
+                            .subsets_not_containing(verifier_id)
+                            .into_iter()
+                            .cloned()
+                            .collect();
+                        for (idx, subset) in dealer_subsets.iter().enumerate() {
+                            if !verifier_subsets.contains(subset) {
+                                continue;
+                            }
+                            let prf = pre_shared[verifier_id]
+                                .prf_keys
+                                .get(subset)
+                                .expect("verifier holds PRF key for every subset in its RSS view");
+                            let mut m_t = Fp::zero(modulus);
+                            for offset in 0..REJECTION_RETRY_BUDGET as u64 {
+                                let cand = prf.evaluate(m_counter + offset, modulus);
+                                if !cand.is_zero() {
+                                    m_t = cand;
+                                    break;
+                                }
+                            }
+                            local_shares.insert(2 * idx, m_t.pow(e));
+                            local_shares.insert(2 * idx + 1, prf.evaluate(a_counter, modulus));
+                        }
+                    }
+
+                    // P2P: the sub-tree authentication paths this verifier
+                    // actually needs for the positions in `local_shares`,
+                    // across every repetition — genuine data, not a
+                    // zero-filled placeholder.
+                    let mut path_data = Vec::new();
+                    for rep in 0..params.repetitions {
+                        for &position in local_shares.keys() {
+                            let wire_idx = position + 1;
+                            if let Some(path) = proof.hidden_sub_tree_paths[rep].get(wire_idx) {
+                                for node in path {
+                                    path_data.extend_from_slice(node);
+                                }
+                            }
+                        }
+                    }
+                    for v in 0..n {
+                        if v != dealer_id {
+                            zkp_net.send_p2p(dealer_id, v, path_data.clone());
+                        }
+                    }
+
                     if !zkp_vith::vith_verify(&proof, &delta, &local_shares, params, modulus) {
                         verdict = DzkpResult::Abort;
                     }

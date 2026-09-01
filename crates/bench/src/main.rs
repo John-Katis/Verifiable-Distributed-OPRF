@@ -26,12 +26,14 @@ use vdoprf_network::{CommStats, SimulatedNetwork};
 use vdoprf_offline::approach_i;
 use vdoprf_offline::approach_ii;
 use vdoprf_offline::approach_iii::{self, ZkpVariant};
+use vdoprf_offline::dzkp::DzkpResult;
 use vdoprf_offline::pub_base_exp::is_coprime;
 use vdoprf_offline::setup_pre_shared;
 use vdoprf_offline::zkp_ligero::LigeroParams;
 use vdoprf_offline::zkp_vith::VitHParams;
 use vdoprf_offline::PreSharedMaterial;
-use vdoprf_online::compute_boyle::BoyleBatchProof;
+use vdoprf_online::compute_batch::VerifiedInputResult;
+use vdoprf_online::compute_boyle::{BoyleBatchProof, BoyleVerifiedInputResult};
 use vdoprf_online::vip::{client_verify_dvoprf, VipParallelOutput, VipResult};
 use vdoprf_online::{
     compute_batch, compute_boyle, setup_random_preprocessed_m, OnlinePreprocessed,
@@ -172,6 +174,12 @@ fn client_deliver_vip_batched(
 /// share material is shipped — so the helper runs in O(m + n) memory writes
 /// and is cheap enough to sit inside the `Instant::now()` window of every
 /// online/e2e cell.
+///
+/// No longer called anywhere: per confirmed scope, every online/e2e cell
+/// now verifies client input via Π_Input instead of this unverified
+/// dealer-style charge. Kept (not deleted) as the reference implementation
+/// of the unverified-input cost, for anyone comparing against it later.
+#[allow(dead_code)]
 fn client_to_servers_input(
     m: usize,
     n: usize,
@@ -195,6 +203,23 @@ fn client_deliver_boyle(
     net: &mut SimulatedNetwork,
     modulus: &BigUint,
 ) -> Vec<Fp> {
+    // `compute_boyle_batch` now returns a controlled `Abort` verdict instead
+    // of panicking on a real DZKP failure — the servers must never deliver
+    // `open_shares` to the client in that case, since they're meaningless
+    // (or adversarially chosen) when the multiplication proof didn't check
+    // out. Charge the 1-byte-per-server verdict announcement and stop.
+    if proof.verdict != DzkpResult::Accept {
+        let n = proof
+            .open_shares
+            .first()
+            .map(|shares| shares.len())
+            .unwrap_or(0);
+        for i in 0..n {
+            net.send_to_client(i, vec![0u8]);
+        }
+        return Vec::new();
+    }
+
     let feb = fe_bytes(modulus);
     let mut outputs = Vec::with_capacity(proof.open_shares.len());
     for c_shares in &proof.open_shares {
@@ -447,6 +472,13 @@ fn run_offline_set(
 // two physical axes of communication: server↔server (internal protocol
 // traffic — VSS, commit-hash broadcasts, RSS.Mul rounds, etc.) and
 // server↔client (input distribution + output/proof opening).
+//
+// Per confirmed scope, client input is verified via Π_Input (Protocol 9,
+// `vdoprf_online::input`) in BOTH rows below — the plain/unverified
+// `compute_batch`/`compute_boyle_batch` functions still exist and are
+// covered by their own unit tests, but are no longer wired into any
+// benchmark. There is deliberately no "with vs. without verification"
+// comparison row left in this table.
 // ---------------------------------------------------------------------------
 
 fn run_online_set(n: usize, t: usize, m: usize, modulus: &BigUint) -> Vec<SplitRow> {
@@ -460,19 +492,24 @@ fn run_online_set(n: usize, t: usize, m: usize, modulus: &BigUint) -> Vec<SplitR
     eprintln!("  [online ] n={}, t={}, m={}", n, t, m);
     let mut out = Vec::new();
 
-    // VIP: ComputeBatch. Time covers: client→server input VSS + server-side
-    // protocol + bench-side client delivery (ṽ additive shares + 5 proof
-    // shares) + client-side reconstruction + `client_verify_vip_parallel`.
+    // VIP: ComputeBatch with Π_Input (Protocol 9), folded 2-round variant.
+    // `Π_Input`'s own real communication cost is already included in
+    // `r.comm` — no separate `client_to_servers_input` charge needed.
     {
         let avg = bench_avg_split(|| {
             let t0 = Instant::now();
-            let input_comm = client_to_servers_input(xs.len(), n, &family, modulus);
-            let r = compute_batch::compute_batch(&xs, &pre, &pre_shared, &family, modulus);
+            let r = match compute_batch::compute_batch_with_verified_input(
+                &xs, &pre, &pre_shared, &family, modulus,
+            ) {
+                VerifiedInputResult::Accept(r) => r,
+                VerifiedInputResult::Abort(_) => {
+                    panic!("bench: Π_Input must Accept on honest execution")
+                }
+            };
             let mut client_net = SimulatedNetwork::new(n);
             let _outs = client_deliver_vip_batched(&r, &mut client_net, modulus);
             let dt = t0.elapsed().as_secs_f64() * 1000.0;
             let mut comm = r.comm;
-            comm.merge(&input_comm);
             comm.merge(&client_net.stats());
             (dt, comm)
         });
@@ -483,14 +520,23 @@ fn run_online_set(n: usize, t: usize, m: usize, modulus: &BigUint) -> Vec<SplitR
         out.push(SplitRow::from_avg(n, t, m, "VIP-ComputeBatch", avg));
     }
 
-    // Boyle-Batch: client→server input VSS + server-side batched RSS.Mul +
-    // batched DZKP + server→client redundant open of c_j with verdict.
+    // Boyle-Batch with Π_Input (Protocol 9), standalone 3-round variant
+    // (Boyle's RSS.Mul + DZKP pipeline has no existing hash-broadcast round
+    // to fold the echo into, unlike VIP's compute_batch — see
+    // `compute_boyle_batch_with_verified_input`'s doc comment). `Π_Input`'s
+    // cost is already included in `comm_server` — no separate
+    // `client_to_servers_input` charge needed.
     {
         let avg = bench_avg_split(|| {
             let t0 = Instant::now();
-            let input_comm = client_to_servers_input(xs.len(), n, &family, modulus);
-            let (_cs, proof, comm_server) =
-                compute_boyle::compute_boyle_batch(&xs, &pre, &pre_shared, &family, modulus);
+            let (_cs, proof, comm_server) = match compute_boyle::compute_boyle_batch_with_verified_input(
+                &xs, &pre, &pre_shared, &family, modulus,
+            ) {
+                BoyleVerifiedInputResult::Accept(cs, proof, comm) => (cs, proof, comm),
+                BoyleVerifiedInputResult::Abort(_) => {
+                    panic!("bench: Π_Input must Accept on honest execution")
+                }
+            };
             let mut client_net = SimulatedNetwork::new(n);
             let _outs = client_deliver_boyle(&proof, &mut client_net, modulus);
             let dt = t0.elapsed().as_secs_f64() * 1000.0;
@@ -499,7 +545,6 @@ fn run_online_set(n: usize, t: usize, m: usize, modulus: &BigUint) -> Vec<SplitR
             // once β = 0 has been locally reconstructed, so the two merge
             // sequentially (rounds add, bytes add).
             let mut comm = comm_server;
-            comm.merge(&input_comm);
             comm.merge(&client_net.stats());
             (dt, comm)
         });
@@ -518,12 +563,17 @@ fn run_online_set(n: usize, t: usize, m: usize, modulus: &BigUint) -> Vec<SplitR
 // ---------------------------------------------------------------------------
 
 /// Which online phase to compose with the offline α^e generator in an e2e
-/// row. `Vip` = our designated-verifier path (`compute_batch` for all m,
-/// matching Section 2's online-standalone VIP cell);
-/// `Boyle` = RSS.Mul + server-verified DZKP (`compute_boyle_batch`).
+/// row. Both variants verify client input via Π_Input — per confirmed
+/// scope, no e2e composition benchmarks the unverified input path.
+/// `VipVerifiedInput` = our designated-verifier path with client input
+/// going through `Π_Input` (`compute_batch_with_verified_input`, matching
+/// Section 2's `VIP-ComputeBatch` cell); `Boyle` = RSS.Mul +
+/// server-verified DZKP, also with client input through `Π_Input`
+/// (`compute_boyle_batch_with_verified_input`, matching Section 2's
+/// `Boyle-Batch` cell).
 #[derive(Clone, Copy)]
 enum OnlineVariant {
-    Vip,
+    VipVerifiedInput,
     Boyle,
 }
 
@@ -734,10 +784,20 @@ fn run_one_e2e_iter(
 
     let t0 = Instant::now();
     let n = family.n;
-    let input_comm = client_to_servers_input(xs.len(), n, family, modulus);
+    // Both variants charge their own client-input cost inside their `comm`
+    // via `Π_Input` (see Section 2's cells for the same reasoning) — per
+    // confirmed scope, no e2e composition benchmarks the unverified input
+    // path, so there is no separate `client_to_servers_input` charge here.
     let online_comm = match online_variant {
-        OnlineVariant::Vip => {
-            let r = compute_batch::compute_batch(xs, &pre, pre_shared, family, modulus);
+        OnlineVariant::VipVerifiedInput => {
+            let r = match compute_batch::compute_batch_with_verified_input(
+                xs, &pre, pre_shared, family, modulus,
+            ) {
+                VerifiedInputResult::Accept(r) => r,
+                VerifiedInputResult::Abort(_) => {
+                    panic!("bench: Π_Input must Accept on honest execution")
+                }
+            };
             let mut client_net = SimulatedNetwork::new(n);
             let _outs = client_deliver_vip_batched(&r, &mut client_net, modulus);
             let mut c = r.comm;
@@ -745,8 +805,14 @@ fn run_one_e2e_iter(
             c
         }
         OnlineVariant::Boyle => {
-            let (_cs, proof, mut c) =
-                compute_boyle::compute_boyle_batch(xs, &pre, pre_shared, family, modulus);
+            let (_cs, proof, mut c) = match compute_boyle::compute_boyle_batch_with_verified_input(
+                xs, &pre, pre_shared, family, modulus,
+            ) {
+                BoyleVerifiedInputResult::Accept(cs, proof, comm) => (cs, proof, comm),
+                BoyleVerifiedInputResult::Abort(_) => {
+                    panic!("bench: Π_Input must Accept on honest execution")
+                }
+            };
             let mut client_net = SimulatedNetwork::new(n);
             let _outs = client_deliver_boyle(&proof, &mut client_net, modulus);
             c.merge(&client_net.stats());
@@ -756,7 +822,6 @@ fn run_one_e2e_iter(
     let online_t = t0.elapsed().as_secs_f64() * 1000.0;
 
     let mut total = offline_comm;
-    total.merge(&input_comm);
     total.merge(&online_comm);
     Some((offline_time + online_t, total))
 }
@@ -767,6 +832,7 @@ fn run_e2e_set(
     modulus: &BigUint,
     e: &BigUint,
     m_values: &[usize],
+    online_variant: OnlineVariant,
 ) -> Vec<Row> {
     let family = SubsetFamily::new(n, t);
     let pre_shared = setup_pre_shared(n, t, modulus);
@@ -779,7 +845,10 @@ fn run_e2e_set(
 
     let mut out = Vec::new();
     for &m in m_values {
-        let online_label = if m == 1 { "Compute" } else { "ComputeBatch" };
+        let mut online_label = if m == 1 { "Compute" } else { "ComputeBatch" }.to_string();
+        if matches!(online_variant, OnlineVariant::VipVerifiedInput) {
+            online_label.push_str(" (verified input)");
+        }
         eprintln!(
             "  [e2e    ] n={}, t={}, m={} (batched α^e, then {})",
             n, t, m, online_label
@@ -804,7 +873,7 @@ fn run_e2e_set(
             let avg = bench_avg(|| {
                 run_one_e2e_iter(
                     short,
-                    OnlineVariant::Vip,
+                    online_variant,
                     m,
                     &family,
                     modulus,
@@ -823,7 +892,10 @@ fn run_e2e_set(
 
         // Baseline: ΠAlyGen (offline) composed with Boyle batched online.
         // Factored into `e2e_aly_boyle_one_cell` so it can be driven
-        // standalone by `e2e_aly_boyle` (see BENCH_SECTION=e2e-aly-boyle).
+        // standalone by `e2e_aly_boyle` (see the `naive-boyle-aly` CLI
+        // experiment). Always uses `OnlineVariant::Boyle`, independent of
+        // this function's own `online_variant` — it's a fixed baseline, not
+        // one of the two variants `run_e2e_set` is parameterized over.
         out.push(e2e_aly_boyle_one_cell(n, t, m, &family, modulus, e, &pre_shared, &xs));
     }
     out
@@ -1008,10 +1080,259 @@ fn print_rows(rows: &[Row], approach_width: usize) {
 }
 
 // ---------------------------------------------------------------------------
+// Section runners — standalone-callable wrappers around Sections 1-3 so the
+// CLI can invoke any one of them (or all of them, matching the historical
+// unconditional-three-sections behaviour) with the same printed output.
+// ---------------------------------------------------------------------------
+
+fn run_section1(parameter_sets: &[(usize, usize)], offline_m: &[usize], modulus: &BigUint, e: &BigUint) {
+    eprintln!("Running Section 1 (offline only, m ∈ {:?})...", offline_m);
+    let mut offline_all = Vec::new();
+    for &(n, t) in parameter_sets {
+        offline_all.extend(run_offline_set(n, t, modulus, e, offline_m));
+    }
+    print_header(
+        &format!(
+            "Section 1 — Offline phase (e=2^{}, kappa={}), m ∈ {:?}",
+            LAMBDA, KAPPA, offline_m
+        ),
+        "Approach",
+        20,
+    );
+    print_rows(&offline_all, 20);
+}
+
+fn run_section2(parameter_sets: &[(usize, usize)], online_m: &[usize], modulus: &BigUint) {
+    eprintln!(
+        "Running Section 2 (online standalone, VIP-ComputeBatch vs Boyle-Batch, m ∈ {:?})...",
+        online_m
+    );
+    let mut online_all: Vec<SplitRow> = Vec::new();
+    for &(n, t) in parameter_sets {
+        for &m in online_m {
+            online_all.extend(run_online_set(n, t, m, modulus));
+        }
+    }
+    print_header_split(
+        &format!(
+            "Section 2 — Online phase standalone, VIP-ComputeBatch vs Boyle-Batch, m ∈ {:?}  (bytes split into server↔server vs server↔client)",
+            online_m
+        ),
+        "Variant",
+        22,
+    );
+    print_split_rows(&online_all, 22);
+}
+
+/// End-to-end section runner, parameterized over which online phase to
+/// compose the offline II/III-a/III-b sweep with (`online_variant`) and over
+/// the progress/header text. Both the generic `e2e` experiment and the named
+/// `our-protocol-verified-input` experiment call this with
+/// `OnlineVariant::VipVerifiedInput` — per confirmed scope there is no
+/// remaining unverified-input e2e composition to distinguish them by, so
+/// the two currently produce identical tables; both names are kept since
+/// they serve different discoverability purposes (generic vs. explicit).
+fn run_section3(
+    parameter_sets: &[(usize, usize)],
+    e2e_m: &[usize],
+    modulus: &BigUint,
+    e: &BigUint,
+    online_variant: OnlineVariant,
+    progress_label: &str,
+    header_title: &str,
+) {
+    eprintln!(
+        "Running {} (e2e, fresh α^e per query, m ∈ {:?})...",
+        progress_label, e2e_m
+    );
+    let mut e2e_all = Vec::new();
+    for &(n, t) in parameter_sets {
+        e2e_all.extend(run_e2e_set(n, t, modulus, e, e2e_m, online_variant));
+    }
+    print_header(&format!("{}, m ∈ {:?}", header_title, e2e_m), "Offline + Online", 28);
+    print_rows(&e2e_all, 28);
+}
+
+/// Standalone `naive-boyle-aly` experiment: ΠAlyGen (offline) + Boyle-Batch
+/// (online) only, no II/III-a/III-b rows — the isolated baseline comparison,
+/// as opposed to `e2e`/`our-protocol*`'s Aly-Boyle row nested alongside the
+/// other offline approaches.
+fn run_section_naive_boyle_aly(parameter_sets: &[(usize, usize)], e2e_m: &[usize], modulus: &BigUint, e: &BigUint) {
+    eprintln!(
+        "Running naive-boyle-aly (ΠAlyGen offline + Boyle-Batch online, m ∈ {:?})...",
+        e2e_m
+    );
+    let mut rows = Vec::new();
+    for &(n, t) in parameter_sets {
+        rows.extend(e2e_aly_boyle(n, t, modulus, e, e2e_m));
+    }
+    print_header(
+        &format!(
+            "naive-boyle-aly — ΠAlyGen + Boyle-Batch online (fresh α^e per query), m ∈ {:?}",
+            e2e_m
+        ),
+        "Offline + Online",
+        28,
+    );
+    print_rows(&rows, 28);
+}
+
+// ---------------------------------------------------------------------------
+// CLI — hand-rolled `std::env::args()` parsing (no new dependency, matching
+// this crate's existing zero-CLI-dependency style).
+// ---------------------------------------------------------------------------
+
+/// Which experiment(s) to run. Defaults to `All`, which reproduces the
+/// historical unconditional three-section run byte-for-byte when no
+/// `--n/--t/--m` overrides are given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Experiment {
+    All,
+    Offline,
+    Online,
+    E2e,
+    OurProtocolVerifiedInput,
+    NaiveBoyleAly,
+}
+
+impl Experiment {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "all" => Some(Experiment::All),
+            "offline" => Some(Experiment::Offline),
+            "online" => Some(Experiment::Online),
+            "e2e" => Some(Experiment::E2e),
+            "our-protocol-verified-input" => Some(Experiment::OurProtocolVerifiedInput),
+            "naive-boyle-aly" => Some(Experiment::NaiveBoyleAly),
+            _ => None,
+        }
+    }
+}
+
+struct Cli {
+    experiment: Experiment,
+    nt_override: Option<(usize, usize)>,
+    m_override: Option<Vec<usize>>,
+}
+
+fn print_usage() {
+    eprintln!("Usage: vdoprf-bench [experiment] [--n N --t T] [--m M1,M2,...]");
+    eprintln!();
+    eprintln!("Experiments:");
+    eprintln!("  all                          (default) run every section: offline + online + e2e");
+    eprintln!("  offline                      Section 1 — offline phase only, all four approaches");
+    eprintln!("  online                       Section 2 — online phase standalone, VIP-ComputeBatch vs Boyle-Batch (both Π_Input-verified)");
+    eprintln!("  e2e                          Section 3 — end-to-end, our protocol (Π_Input-verified) + naive Boyle+AlyGen baseline (Π_Input-verified)");
+    eprintln!("  our-protocol-verified-input  e2e, our protocol with Π_Input (verifiable client input sharing) — same table as 'e2e'");
+    eprintln!("  naive-boyle-aly              e2e, the naive Boyle+AlyGen baseline (Π_Input-verified) in isolation");
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  --n N --t T     override the (n,t) sweep with a single pair (both required together)");
+    eprintln!("  --m M1,M2,...   override the m sweep, comma-separated, e.g. --m 1,100");
+    eprintln!("  --help          print this message and exit");
+}
+
+fn parse_cli(args: &[String]) -> Cli {
+    let mut experiment = Experiment::All;
+    let mut n: Option<usize> = None;
+    let mut t: Option<usize> = None;
+    let mut m_override: Option<Vec<usize>> = None;
+
+    let mut i = 0;
+    if let Some(first) = args.get(i) {
+        if first == "--help" || first == "-h" {
+            print_usage();
+            std::process::exit(0);
+        }
+        if !first.starts_with("--") {
+            match Experiment::parse(first) {
+                Some(e) => experiment = e,
+                None => {
+                    eprintln!("error: unknown experiment '{}'", first);
+                    print_usage();
+                    std::process::exit(1);
+                }
+            }
+            i += 1;
+        }
+    }
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--help" | "-h" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            "--n" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("error: --n requires a value");
+                    print_usage();
+                    std::process::exit(1);
+                };
+                n = Some(v.parse().unwrap_or_else(|_| {
+                    eprintln!("error: --n value must be a positive integer, got '{}'", v);
+                    std::process::exit(1);
+                }));
+                i += 2;
+            }
+            "--t" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("error: --t requires a value");
+                    print_usage();
+                    std::process::exit(1);
+                };
+                t = Some(v.parse().unwrap_or_else(|_| {
+                    eprintln!("error: --t value must be a positive integer, got '{}'", v);
+                    std::process::exit(1);
+                }));
+                i += 2;
+            }
+            "--m" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("error: --m requires a value");
+                    print_usage();
+                    std::process::exit(1);
+                };
+                let values: Result<Vec<usize>, _> =
+                    v.split(',').map(|s| s.trim().parse()).collect();
+                m_override = Some(values.unwrap_or_else(|_| {
+                    eprintln!(
+                        "error: --m value must be a comma-separated list of positive integers, got '{}'",
+                        v
+                    );
+                    std::process::exit(1);
+                }));
+                i += 2;
+            }
+            other => {
+                eprintln!("error: unknown argument '{}'", other);
+                print_usage();
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let nt_override = match (n, t) {
+        (Some(n), Some(t)) => Some((n, t)),
+        (None, None) => None,
+        _ => {
+            eprintln!("error: --n and --t must be given together");
+            print_usage();
+            std::process::exit(1);
+        }
+    };
+
+    Cli { experiment, nt_override, m_override }
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let cli = parse_cli(&args);
+
     // Gold PRF prime per Yang et al. [SP:YBHKR25]: p = e*g + 1 with e = 2^lambda
     // and log g = 2*lambda + O(1). At lambda=128 this gives |p| = 3*lambda = 384.
     // We pick g = 2^256 - 573 (smallest odd c >= 1 making p prime), so
@@ -1041,102 +1362,60 @@ fn main() {
     println!("    FE      = {} bytes", fe_bytes_val);
     println!();
 
-    // Note: the C-Legendre dOPRF baseline lives outside this Rust harness —
-    // run `python3 d-OPRF/Legendre-dOPRF-network/bench_e2e.py` to collect
-    // that row (after `bash d-OPRF/Legendre-dOPRF-network/build_all.sh`).
-    //
-    // Four toggleable sections below. Each one is a self-contained `{ ... }`
-    // block that declares its own result vector, runs the sweep, and prints
-    // the table. Comment the whole block out to skip the section; uncomment
-    // to run. Sections are independent.
+    // Note: the C-Legendre dOPRF baseline lives outside this Rust harness,
+    // in the `d-OPRF/` git submodule — see `./run_legendre_baseline.sh` at
+    // the repo root (a safety wrapper that drives it without modifying the
+    // submodule's own tracked files) or `./run_bench.sh legendre-dOPRF`.
 
-    let parameter_sets: Vec<(usize, usize)> = vec![(3,1), (5,2), (7,3), (9,4)];
-    let offline_m: Vec<usize> = vec![1, 100];
-    let online_m: Vec<usize> = vec![1, 100];
-    let e2e_m: Vec<usize> = vec![1, 100];
+    // Default (n,t) and m sweeps — reproduced byte-for-byte by `Experiment::All`
+    // (and by `offline`/`online`/`e2e` individually) when no --n/--t/--m
+    // override is given; this is the CLI's regression-safety bar.
+    let parameter_sets: Vec<(usize, usize)> = match cli.nt_override {
+        Some(pair) => vec![pair],
+        None => vec![(3, 1), (5, 2), (7, 3), (9, 4)],
+    };
+    let offline_m: Vec<usize> = cli.m_override.clone().unwrap_or_else(|| vec![1, 100]);
+    let online_m: Vec<usize> = cli.m_override.clone().unwrap_or_else(|| vec![1, 100]);
+    let e2e_m: Vec<usize> = cli.m_override.clone().unwrap_or_else(|| vec![1, 100]);
 
-    // ----------------------------------------------------------------------
-    // Section 1 — Offline phase only. Skipped for this run: the client-input
-    // accounting change touches only the online and e2e cells.
-    // ----------------------------------------------------------------------
-    {
-        eprintln!("Running Section 1 (offline only, m ∈ {:?})...", offline_m);
-        let mut offline_all = Vec::new();
-        for &(n, t) in &parameter_sets {
-            offline_all.extend(run_offline_set(n, t, &modulus, &e, &offline_m));
+    match cli.experiment {
+        Experiment::All => {
+            run_section1(&parameter_sets, &offline_m, &modulus, &e);
+            run_section2(&parameter_sets, &online_m, &modulus);
+            run_section3(
+                &parameter_sets,
+                &e2e_m,
+                &modulus,
+                &e,
+                OnlineVariant::VipVerifiedInput,
+                "Section 3",
+                "Section 3 — End-to-end (fresh α^e per query, all verifications included, Π_Input-verified client input)",
+            );
         }
-        print_header(
-            &format!(
-                "Section 1 — Offline phase (e=2^{}, kappa={}), m ∈ {:?}",
-                LAMBDA, KAPPA, offline_m
-            ),
-            "Approach",
-            20,
-        );
-        print_rows(&offline_all, 20);
-    }
-
-    // ----------------------------------------------------------------------
-    // Section 2 — Online standalone: VIP-ComputeBatch vs. Boyle-Batch.
-    // ----------------------------------------------------------------------
-    {
-        eprintln!("Running Section 2 (online standalone, VIP-ComputeBatch vs Boyle-Batch, m ∈ {:?})...", online_m);
-        let mut online_all: Vec<SplitRow> = Vec::new();
-        for &(n, t) in &parameter_sets {
-            for &m in &online_m {
-                online_all.extend(run_online_set(n, t, m, &modulus));
-            }
+        Experiment::Offline => run_section1(&parameter_sets, &offline_m, &modulus, &e),
+        Experiment::Online => run_section2(&parameter_sets, &online_m, &modulus),
+        Experiment::E2e => run_section3(
+            &parameter_sets,
+            &e2e_m,
+            &modulus,
+            &e,
+            OnlineVariant::VipVerifiedInput,
+            "Section 3",
+            "Section 3 — End-to-end (fresh α^e per query, all verifications included, Π_Input-verified client input)",
+        ),
+        Experiment::OurProtocolVerifiedInput => run_section3(
+            &parameter_sets,
+            &e2e_m,
+            &modulus,
+            &e,
+            OnlineVariant::VipVerifiedInput,
+            "our-protocol-verified-input",
+            "our-protocol-verified-input — end-to-end, our protocol with Π_Input (fresh α^e per query, all verifications included)",
+        ),
+        Experiment::NaiveBoyleAly => {
+            run_section_naive_boyle_aly(&parameter_sets, &e2e_m, &modulus, &e)
         }
-        print_header_split(
-            &format!(
-                "Section 2 — Online phase standalone, VIP-ComputeBatch vs Boyle-Batch, m ∈ {:?}  (bytes split into server↔server vs server↔client)",
-                online_m
-            ),
-            "Variant",
-            22,
-        );
-        print_split_rows(&online_all, 22);
     }
-
-    // ----------------------------------------------------------------------
-    // Section 3 — End-to-end (our offline approaches + VIP online).
-    // ----------------------------------------------------------------------
-    {
-        eprintln!("Running Section 3 (e2e, fresh α^e per query, m ∈ {:?})...", e2e_m);
-        let mut e2e_all = Vec::new();
-        for &(n, t) in &parameter_sets {
-            e2e_all.extend(run_e2e_set(n, t, &modulus, &e, &e2e_m));
-        }
-        print_header(
-            &format!(
-                "Section 3 — End-to-end (fresh α^e per query, all verifications included), m ∈ {:?}",
-                e2e_m
-            ),
-            "Offline + Online",
-            28,
-        );
-        print_rows(&e2e_all, 28);
-    }
-
-    // ----------------------------------------------------------------------
-    // Section 3 standalone baseline — ΠAlyGen + Boyle online.
-    // ----------------------------------------------------------------------
-    // {
-    //     eprintln!("Running Section 3 standalone — ΠAlyGen + Boyle online, m ∈ {:?}...", e2e_m);
-    //     let mut e2e_aly_boyle_all = Vec::new();
-    //     for &(n, t) in &parameter_sets {
-    //         e2e_aly_boyle_all.extend(e2e_aly_boyle(n, t, &modulus, &e, &e2e_m));
-    //     }
-    //     print_header(
-    //         "Section 3 (standalone) — ΠAlyGen + Boyle online, m ∈ {1, 35}",
-    //         "Offline + Online",
-    //         28,
-    //     );
-    //     print_rows(&e2e_aly_boyle_all, 28);
-    // }
-
-    // Suppress unused-var warnings when sections above are commented out.
-    let _ = (&parameter_sets, &offline_m, &online_m, &e2e_m);
 
     println!();
 }

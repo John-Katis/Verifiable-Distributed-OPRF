@@ -3,20 +3,50 @@
 //! a commit-then-hash round binds each server's `ṽ_i^{(k)}` values; ε_k
 //! challenges batch the m relations into one; a single Π_VIP^Prl verifies
 //! the aggregated relation.
+//!
+//! Two client-input variants are exposed:
+//! - [`compute_batch`] — unchanged: client input via the unverified
+//!   `share()`-as-dealer path (`share_add_and_extract_pairs`). Kept
+//!   exactly as-is so it remains usable as the "no input verification"
+//!   comparison baseline (matching the other online baselines, which don't
+//!   verify input either).
+//! - [`compute_batch_with_verified_input`] — client input via `Π_Input`
+//!   (Protocol 9, [`crate::input`]), folded: step 4's echo is merged into
+//!   this function's own existing commit-then-hash round (Step 2 below)
+//!   rather than costing a separate round, matching the paper's stated
+//!   2-round composed cost (vs. 3 standalone).
 
 use num_bigint::BigUint;
 use vdoprf_crypto::hash::{hash_bytes, hash_field_elements};
-use vdoprf_crypto::transcript::Transcript;
 use vdoprf_field::Fp;
-use vdoprf_network::SimulatedNetwork;
+use vdoprf_network::{CommStats, SimulatedNetwork};
 use vdoprf_offline::double_rand::generate_zero_additive_sharing;
 use vdoprf_offline::PreSharedMaterial;
 use vdoprf_ss::{SubsetFamily, SubsetT};
 
+use crate::input::{client_input_share, InputResult};
 use crate::vip::vip_parallel;
 use crate::{
-    share_add_and_extract_pairs, OnlinePreprocessed, OnlineProof, OnlineResult, VipDvoprfOutput,
+    extract_pairs_from_x_shares, share_add_and_extract_pairs, OnlinePreprocessed, OnlineProof,
+    OnlineResult, PerInputPairs, VipDvoprfOutput,
 };
+
+/// Fresh, never-reused counter base for `Π_Input`'s `[r^(j)]` masks in the
+/// verified-input path — distinct from every other counter base already in
+/// use in this crate (`compute.rs`=3000, `compute_parallel.rs`=2000, this
+/// file's own `rand_counter`=4000 and zero-sharing=100000+, `compute_boyle.rs`
+/// =10000/20000).
+const INPUT_COUNTER_BASE: u64 = 60_000;
+
+/// Outcome of [`compute_batch_with_verified_input`]: either the same
+/// [`OnlineResult`] `compute_batch` would produce, or an `Abort` (with the
+/// communication already spent on the failed input protocol) if `Π_Input`
+/// rejected the client's input.
+#[derive(Debug)]
+pub enum VerifiedInputResult {
+    Accept(OnlineResult),
+    Abort(CommStats),
+}
 
 pub fn compute_batch(
     xs: &[Fp],
@@ -25,9 +55,59 @@ pub fn compute_batch(
     family: &SubsetFamily,
     modulus: &BigUint,
 ) -> OnlineResult {
-    let (per_input, mut comm) =
-        share_add_and_extract_pairs(xs, pre, family, modulus);
+    let (per_input, comm) = share_add_and_extract_pairs(xs, pre, family, modulus);
+    compute_batch_inner(&per_input, None, pre_shared, family, modulus, comm)
+}
 
+/// Same as [`compute_batch`], but client input goes through `Π_Input`
+/// (folded, 2-round) first: `Π_Input` steps 1-3 mask-and-open `x` with an
+/// abort-checked hash (`ψ_i`), and step 4's echo (`χ_i`) is folded into
+/// this function's own Step 2 hash-exchange below instead of costing its
+/// own round. On `Π_Input` abort, returns `VerifiedInputResult::Abort`
+/// without running the rest of the protocol.
+pub fn compute_batch_with_verified_input(
+    xs: &[Fp],
+    pre: &OnlinePreprocessed,
+    pre_shared: &[PreSharedMaterial],
+    family: &SubsetFamily,
+    modulus: &BigUint,
+) -> VerifiedInputResult {
+    let (verdict, x_shares_per_input, u, input_comm) =
+        client_input_share(xs, pre_shared, family, modulus, INPUT_COUNTER_BASE);
+    if verdict == InputResult::Abort {
+        return VerifiedInputResult::Abort(input_comm);
+    }
+    let per_input = extract_pairs_from_x_shares(&x_shares_per_input, pre, family, modulus);
+    VerifiedInputResult::Accept(compute_batch_inner(
+        &per_input,
+        Some(&u),
+        pre_shared,
+        family,
+        modulus,
+        input_comm,
+    ))
+}
+
+/// Shared body of both entry points above: steps 1-6 of Π_dVOPRF, given
+/// already-obtained per-input cross-product pairs and however much comm
+/// the client-input stage has already spent.
+///
+/// `chi_fold`: `None` for the unverified path (today's behavior,
+/// unchanged); `Some(u)` for the verified-input path — rides `Π_Input`
+/// step 4's echo (`χ_i = H(u)`) alongside this function's Step 2 hash
+/// broadcast (appended to the same message, not combined into `h_i`'s own
+/// hash — `h_i` stays byte-identical either way so the client's existing,
+/// unmodified `ε_k` re-derivation from `tilde_v` keeps working), costing
+/// `+32` bytes per server in that same round rather than a whole separate
+/// standalone echo round.
+fn compute_batch_inner(
+    per_input: &[PerInputPairs],
+    chi_fold: Option<&[Fp]>,
+    pre_shared: &[PreSharedMaterial],
+    family: &SubsetFamily,
+    modulus: &BigUint,
+    mut comm: CommStats,
+) -> OnlineResult {
     let n = family.n;
     let m = per_input.len();
 
@@ -69,13 +149,24 @@ pub fn compute_batch(
     }
 
     // Step 2: commit-then-hash round. Each server S_i broadcasts
-    // h_i = H(ṽ_i^{(1)} ‖ … ‖ ṽ_i^{(m)}). Charge bytes and 1 round.
+    // h_i = H(ṽ_i^{(1)} ‖ … ‖ ṽ_i^{(m)}) — `h_list`/the ε_k derivation
+    // below is byte-identical regardless of `chi_fold`, so the client's
+    // independent re-derivation of ε_k from `tilde_v` (`client_verify_dvoprf`
+    // in `vip.rs`) keeps working unmodified either way. When folding
+    // `Π_Input`'s χ_i echo in, its bytes ride the SAME broadcast message
+    // (not combined into `h_i`'s own hash) — same round, `+32` bytes per
+    // server, instead of a separate standalone echo round.
+    let chi = chi_fold.map(hash_field_elements);
     let mut commit_net = SimulatedNetwork::new(n);
     let mut h_list: Vec<[u8; 32]> = Vec::with_capacity(n);
     for i in 0..n {
-        let h = hash_field_elements(&tilde_v[i]);
-        commit_net.broadcast(i, h.to_vec());
-        h_list.push(h);
+        let own_h = hash_field_elements(&tilde_v[i]);
+        let mut payload = own_h.to_vec();
+        if let Some(chi) = &chi {
+            payload.extend_from_slice(chi);
+        }
+        commit_net.broadcast(i, payload);
+        h_list.push(own_h);
     }
     comm.merge(&commit_net.stats());
 
@@ -114,18 +205,18 @@ pub fn compute_batch(
         }
     }
 
-    // Step 5: single Π_VIP^Prl over the aggregated relation. Seed the
-    // transcript with the commit-round root so the FS state binds the
-    // proof to each server's {ṽ_i^{(k)}}.
-    let mut transcript = Transcript::new(b"vdoprf.online.compute_batch");
-    transcript.append_commitment(&rho_eps_digest);
+    // Step 5: single Π_VIP^Prl over the aggregated relation. `vip_parallel`
+    // draws its own F_coin challenges internally (genuine coin tosses —
+    // Appendix L says Fiat-Shamir does not apply to this batched protocol),
+    // so no transcript needs to be threaded in here. `rho_eps_digest` above
+    // is unrelated: it derives this function's own ε_k batching coefficients
+    // (Protocol 6), which stay a commit-then-hash construction as-is.
     let mut rand_counter = 4_000u64;
     let (vip_out, vip_comm) = vip_parallel(
         &per_prover_pairs,
         &per_prover_targets,
         family,
         modulus,
-        &mut transcript,
         pre_shared,
         &mut rand_counter,
     );
@@ -680,5 +771,113 @@ mod tests {
             client_verify_dvoprf(&b.vip, &b.tilde_v, &modulus),
             VipResult::Abort,
         );
+    }
+
+    // ---- compute_batch_with_verified_input (Π_Input, folded) ----
+
+    /// Honest path: verified-input and unverified `compute_batch` must
+    /// agree on `client_outputs` for the same `(xs, pre)` — the refactor
+    /// that factored `extract_pairs_from_x_shares` out must not have
+    /// changed the underlying math, only how `x`'s shares are obtained.
+    #[test]
+    fn compute_batch_with_verified_input_matches_compute_batch() {
+        let (_n, modulus, family, pre_shared, pre) = small_setup(3);
+        let mut rng = rand::thread_rng();
+        let xs: Vec<Fp> = (0..3).map(|_| Fp::random(&modulus, &mut rng)).collect();
+
+        let plain = compute_batch(&xs, &pre, &pre_shared, &family, &modulus);
+        let verified = compute_batch_with_verified_input(&xs, &pre, &pre_shared, &family, &modulus);
+
+        match verified {
+            VerifiedInputResult::Accept(r) => {
+                for (a, b) in plain.client_outputs.iter().zip(r.client_outputs.iter()) {
+                    assert_eq!(a.value, b.value);
+                }
+                let b = unwrap_batched(&r.proof);
+                assert_eq!(
+                    client_verify_vip_parallel(&b.vip, &modulus),
+                    VipResult::Accept,
+                );
+                // The full Π_dVOPRF^m verdict additionally re-derives ε_k
+                // from `tilde_v` and checks the `c` binding — this is what
+                // actually caught the fold-into-h_i bug (an earlier version
+                // combined χ into h_i itself, silently shifting the
+                // server-side ε_k away from what the client independently
+                // re-derives from `tilde_v`).
+                assert_eq!(
+                    client_verify_dvoprf(&b.vip, &b.tilde_v, &modulus),
+                    VipResult::Accept,
+                );
+            }
+            VerifiedInputResult::Abort(_) => panic!("honest input must not abort"),
+        }
+    }
+
+    /// `compute_batch_with_verified_input`'s communication cost must
+    /// exceed `compute_batch`'s (real input-verification overhead is now
+    /// charged), while the round count only grows by the folded design's
+    /// expected amount (not a full extra standalone round for step 4).
+    #[test]
+    fn compute_batch_with_verified_input_costs_more_bytes_same_round_budget() {
+        let (_n, modulus, family, pre_shared, pre) = small_setup(2);
+        let mut rng = rand::thread_rng();
+        let xs: Vec<Fp> = (0..2).map(|_| Fp::random(&modulus, &mut rng)).collect();
+
+        let plain = compute_batch(&xs, &pre, &pre_shared, &family, &modulus);
+        let verified = match compute_batch_with_verified_input(&xs, &pre, &pre_shared, &family, &modulus) {
+            VerifiedInputResult::Accept(r) => r,
+            VerifiedInputResult::Abort(_) => panic!("honest input must not abort"),
+        };
+
+        assert!(
+            verified.comm.total_bytes() + verified.comm.client_bytes
+                > plain.comm.total_bytes() + plain.comm.client_bytes,
+            "Π_Input's real accounting must cost more than the unverified path's untracked input step",
+        );
+    }
+
+    /// A server whose locally-held PRF key material for one subset
+    /// disagrees with what the designated sender used (simulating a
+    /// corrupted/malicious server) must be caught by `Π_Input`'s `ψ_i`
+    /// check, surfacing as `VerifiedInputResult::Abort` — not silently
+    /// producing a wrong result.
+    #[test]
+    fn compute_batch_with_verified_input_aborts_on_forged_server_key() {
+        let (n, modulus, family, mut pre_shared, pre) = small_setup(2);
+        let mut rng = rand::thread_rng();
+        let xs: Vec<Fp> = (0..2).map(|_| Fp::random(&modulus, &mut rng)).collect();
+
+        // Pick a subset T and a holder `victim` of T that is NOT the
+        // designated sender for T, then corrupt `victim`'s copy of T's key
+        // — `assembled` (built from the sender's untouched copy) stays
+        // correct, but `victim`'s own recomputed list now disagrees.
+        let subset = family
+            .subsets
+            .iter()
+            .find(|t| {
+                let holders: Vec<usize> = (0..n).filter(|p| !t.contains(p)).collect();
+                holders.len() >= 2
+            })
+            .copied()
+            .expect("need a subset with at least 2 holders for n=3,t=1");
+        let sender = vdoprf_ss::covering_policy(&subset, n);
+        let victim = (0..n)
+            .find(|&p| !subset.contains(&p) && p != sender)
+            .expect("need a second holder distinct from the designated sender");
+
+        // Swap in a different subset's key material for `victim`'s copy of
+        // `subset` — same map shape (no missing keys), different value.
+        let other_subset = *family
+            .subsets
+            .iter()
+            .find(|t| **t != subset && pre_shared[victim].prf_keys.contains_key(t))
+            .expect("need another subset victim also holds a key for");
+        let swapped_key = pre_shared[victim].prf_keys[&other_subset].clone();
+        pre_shared[victim].prf_keys.insert(subset, swapped_key);
+
+        match compute_batch_with_verified_input(&xs, &pre, &pre_shared, &family, &modulus) {
+            VerifiedInputResult::Abort(_) => {}
+            VerifiedInputResult::Accept(_) => panic!("forged server key must be caught by ψ_i, not accepted"),
+        }
     }
 }
