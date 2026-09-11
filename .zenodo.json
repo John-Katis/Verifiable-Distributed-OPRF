@@ -1,0 +1,22 @@
+{
+  "title": "Supplementary code artifact for CCS submission: High-throughput Verifiable Distributed OPRF from Gold PRF",
+  "description": "Rust prototype implementation of the verifiable distributed OPRF (v-dOPRF) protocols described in the paper, plus the external Legendre-dOPRF baseline of Kaluđerović et al. (ESORICS 2025) used in the evaluation.",
+  "creators": [
+    { "name": "Cheng, Nan" },
+    { "name": "Kasashima, Yugo" },
+    { "name": "Watanabe, Yohei" },
+    { "name": "Katis, Ioannis" },
+    { "name": "Mitrokotsa, Aikaterini" }
+  ],
+  "license": "MIT",
+  "upload_type": "software",
+  "access_right": "open",
+  "keywords": [
+    "OPRF",
+    "distributed OPRF",
+    "secret sharing",
+    "multi-party computation",
+    "verifiable computation",
+    "CCS"
+  ]
+}
