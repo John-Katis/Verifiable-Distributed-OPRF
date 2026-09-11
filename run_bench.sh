@@ -3,9 +3,9 @@
 #   - the Rust harness (`crates/bench`, offline/online/e2e sections + the
 #     `our-protocol-verified-input`/`naive-boyle-aly` named experiments —
 #     see `cargo run --release -p vdoprf-bench -- --help`), and
-#   - the external Legendre-dOPRF baseline (`d-OPRF` submodule), wrapped
+#   - the external Legendre-dOPRF baseline (vendored in `d-OPRF/`), wrapped
 #     safely by `./run_legendre_baseline.sh` (see that script's header for
-#     why it exists rather than calling the submodule's own scripts).
+#     why it exists rather than calling the vendored tree's own scripts).
 #
 # Usage:
 #   ./run_bench.sh

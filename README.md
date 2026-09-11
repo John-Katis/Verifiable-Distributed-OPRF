@@ -1,12 +1,11 @@
 # v-dOPRF
 
-Rust prototype implementation of the verifiable distributed OPRF protocols described in `overleaf-protocols/`, plus the external Legendre-dOPRF baseline of Kaluđerović et al (ESORICS 2025) used in the evaluation.
+Rust prototype implementation of the verifiable distributed OPRF protocols described in the paper, plus the external Legendre-dOPRF baseline of Kaluđerović et al (ESORICS 2025) used in the evaluation.
 
 ## Layout
 
 ```
 crates/                Rust workspace (this paper's protocols + bench harness)
-overleaf-protocols/    LaTeX sources for the paper
 d-OPRF/                External baseline: Legendre-dOPRF (Kaluđerović et al., ESORICS 2025)
 ```
 
@@ -37,10 +36,35 @@ d-OPRF/                External baseline: Legendre-dOPRF (Kaluđerović et al., 
 
 ## `d-OPRF/` — external baseline
 
-Implementation of the Legendre-OPRF construction by Kaluđerović et al (ESORICS 2025) [[ESORICS:KalCheMit25]](https://eprint.iacr.org/2024/1834), used as the closest available distributed OPRF baseline in §6. Two trees:
+Implementation of the Legendre-OPRF construction by Kaluđerović et al (ESORICS 2025) [[ESORICS:KalCheMit25]](https://eprint.iacr.org/2024/1834), used as the closest available distributed OPRF baseline in §6. Vendored directly into this repo (originally tracked as a `git submodule` of https://github.com/nann-cheng/d-OPRF.git during development; flattened into plain tracked files here so the artifact doesn't depend on a third-party remote at clone/archive time — some local patches below were never pushed upstream). Two trees:
 
 - `Legendre-dOPRF/` — original single-machine implementation (https://github.com/nkKolja/Legendre-dOPRF).
-- `Legendre-dOPRF-network/` — network-instrumented fork producing the WAN numbers reported in `bench-e2e`.
+- `Legendre-dOPRF-network/` — network-instrumented fork producing the WAN numbers reported in `bench-e2e`. Two local patches on top of the upstream fork, both described in full in `run_legendre_baseline.sh`'s header comment: (1) a 384-bit field (`SEC_LEVEL=5`, using this repo's own Gold-PRF modulus) matching the paper's own `|p|=384` setup — upstream only ships 64/128/192/256/512-bit fields; (2) `sizeof()`-exact offline-phase byte instrumentation in `network-version/server.c`.
+
+## Requirements & setup
+
+Everything here runs on a single machine — `SimulatedNetwork` counts bytes/rounds analytically in-process, so no multi-node setup or real network is used at runtime. Network access is only needed once, to fetch build dependencies (Rust crates via `cargo`, and — only if you're building the Legendre baseline — the BLAKE3 C library).
+
+**1. Nothing to fetch separately.** `d-OPRF/` is vendored directly into this repo (not a git submodule) — a plain `git clone` gets everything, including the local patches to the upstream Legendre-dOPRF code (see below).
+
+**2. Rust toolchain.** A `rust-toolchain.toml` pins `1.87.0` (what this artifact was built/tested with); `rustup` will fetch it automatically on first `cargo build`/`cargo run` in this directory. Needed for every experiment.
+
+**3. C toolchain + BLAKE3 — only needed for the `e2e`/`all`/`legendre-dOPRF` endpoints** (anything that touches the external Legendre-dOPRF baseline). The Rust-only endpoints (`offline`, `online`, `our-protocol-verified-input`, `naive-boyle-aly`, or `cargo run` directly) don't need this. `run_legendre_baseline.sh` rebuilds the baseline's C client/server on every invocation (`make clean && make client384 server384`), which requires `gcc`, `make`, and the BLAKE3 C library installed system-wide:
+
+```bash
+# Debian/Ubuntu
+sudo apt-get install -y gcc make cmake git
+git clone https://github.com/BLAKE3-team/BLAKE3.git /tmp/BLAKE3
+cmake -S /tmp/BLAKE3/c -B /tmp/BLAKE3/build -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build /tmp/BLAKE3/build
+sudo cmake --install /tmp/BLAKE3/build
+# installs libblake3.a to /usr/local/lib and blake3.h to /usr/local/include,
+# where the vendored Makefile expects them
+```
+
+(macOS: `brew install blake3`. See `d-OPRF/Legendre-dOPRF-network/README.md` for the upstream instructions this is adapted from.)
+
+**4. Python** is *not* required for reproduction — nothing on the `run_bench.sh`/`run_legendre_baseline.sh` path invokes Python. (`d-OPRF/Legendre-dOPRF-network/measure_offline.py` is a standalone helper the vendored tree ships but this artifact doesn't call.)
 
 ## Running the benchmarks
 
@@ -48,13 +72,11 @@ Implementation of the Legendre-OPRF construction by Kaluđerović et al (ESORICS
 ./run_bench.sh
 ```
 
-Produces all three §6 tables. WAN model is fixed at 100 ms RTT / 100 Mbps; bytes and rounds are counted analytically by `SimulatedNetwork`, computation is the mean of `BENCH_ITERS` real runs. See `crates/bench/src/main.rs` for the section gating and parameter sweep.
+Produces all three §6 tables (`bench-offline`, `bench-online`, `bench-e2e`) to stdout, plus the Legendre-dOPRF baseline section. See `crates/bench/src/main.rs` for the section gating and parameter sweep.
 
-The legendre d-OPRF results can be reproduced by entering d-OPRF/Legendre-dOPRF-network and running:
+**Byte and round counts are analytic** (counted by `SimulatedNetwork`/the Legendre baseline's own `sizeof()` instrumentation) and should match exactly across machines. **Wall-clock timings will not match exactly** across hardware — they're the mean of `BENCH_ITERS` real local runs (fixed at `10`, a compile-time constant in `crates/bench/src/avg.rs`, not a runtime flag), scaled through the WAN model. The WAN model itself (100 ms RTT / 100 Mbps) is likewise fixed at compile time (`WAN_RTT_MS`/`WAN_BW_MBPS` in `crates/bench/src/main.rs`) rather than a CLI/env option — edit those constants and rebuild to change it.
 
-```
-python3 benche2e.py
-```
+**Runtime:** the Rust-only sections (`offline`/`online`/`e2e`) run in well under a minute for the full sweep. The Legendre-dOPRF baseline is the slow part: each `m=100` cell restarts its server set and re-runs the client 100 times sequentially, and the `(t,n)=(2,7)` cell alone takes on the order of ~8 minutes (7-server restart × 100; see `CHANGELOG.md`). A full `./run_bench.sh all` (both `(t,n)` pairs × both `m` values for Legendre, plus the Rust sweep) should be expected to take on the order of tens of minutes, dominated by the two `m=100` Legendre cells — it has not hung if it's still running past that.
 
 ## Exposed experiment endpoints
 
@@ -71,7 +93,7 @@ There are six named Rust experiments (case-sensitive, exact strings), plus one m
 | `naive-boyle-aly` | Just the naive Boyle+AlyGen baseline in isolation (offline AlyGen + online Boyle) — no offline II/III-a/III-b rows. |
 | `all` | **`offline` + `online` + `e2e`, run one after another** — every table above, in one invocation. |
 
-**The seventh endpoint, `legendre-dOPRF`, is the external Legendre-dOPRF baseline** (Kaluđerović et al., ESORICS 2025, in the `d-OPRF/` submodule) — it's not one of the six Rust `Experiment` names above (it's a different program entirely, run via `./run_legendre_baseline.sh`, with its own `--tn` flag instead of `--n`/`--t` (see its own subsection below). `./run_bench.sh e2e` and `./run_bench.sh all` run it automatically as a trailing section since it's the closest external comparison point for an end-to-end query. It's not run alongside `offline`/`online` (which have no counterpart in Legendre-dOPRF to compare against) unless you call `./run_bench.sh legendre-dOPRF` directly.
+**The seventh endpoint, `legendre-dOPRF`, is the external Legendre-dOPRF baseline** (Kaluđerović et al., ESORICS 2025, vendored in `d-OPRF/`) — it's not one of the six Rust `Experiment` names above (it's a different program entirely, run via `./run_legendre_baseline.sh`, with its own `--tn` flag instead of `--n`/`--t` (see its own subsection below). `./run_bench.sh e2e` and `./run_bench.sh all` run it automatically as a trailing section since it's the closest external comparison point for an end-to-end query. It's not run alongside `offline`/`online` (which have no counterpart in Legendre-dOPRF to compare against) unless you call `./run_bench.sh legendre-dOPRF` directly.
 
 **Omitting `--n`/`--t`/`--m` entirely already gives you the full sweep over every `(n,t)` pair and `m ∈ {1,100}`** — that's the default, not something you need to spell out:
 
@@ -147,4 +169,4 @@ Examples:
 ./run_legendre_baseline.sh --tn 2,7 --m 100      # one cell, m=100 (slow — 7-server restart x 100)
 ```
 
-Runs the vendored C client/server binaries safely from outside a shell session's own working directory and restores the submodule to its committed baseline on exit, even on interruption.
+Runs the vendored C client/server binaries safely from outside a shell session's own working directory and restores the vendored tree to its committed baseline on exit, even on interruption.

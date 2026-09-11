@@ -1,0 +1,10 @@
+# Build outputs — rebuilt from source by ../../run_legendre_baseline.sh
+client256
+client384
+client512
+server256
+server384
+server512
+
+# Run logs from previous local invocations
+*.log

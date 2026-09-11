@@ -1,13 +1,14 @@
 #!/bin/bash
 # Safety wrapper around the external Legendre-dOPRF baseline (Kaluđerović et
-# al., ESORICS'25), vendored as the `d-OPRF` git submodule. Drives the
-# submodule's own build-and-run pattern (the undocumented real entry points
-# are `go128.sh`/`go256.sh`, which this script does NOT invoke or modify)
-# from the outside: it sed-patches the submodule's `dOPRF.h`, builds, runs
-# the client/server binaries itself with correctly-tracked PIDs (the
+# al., ESORICS'25), vendored directly into this repo at `d-OPRF/` (plain
+# tracked files, not a git submodule — see the README for why). Drives the
+# vendored tree's own build-and-run pattern (the undocumented real entry
+# points are `go128.sh`/`go256.sh`, which this script does NOT invoke or
+# modify) from the outside: it sed-patches the vendored `dOPRF.h`, builds,
+# runs the client/server binaries itself with correctly-tracked PIDs (the
 # upstream scripts' own `wait $CLIENT_PID` is a no-op bug — `$!` is captured
 # after the foreground client has already finished), and always restores the
-# submodule to its committed baseline afterward.
+# vendored tree to its committed baseline afterward.
 #
 # Field size: 384 bits (`client384`/`server384`, SEC_LEVEL=5), using this
 # repo's own Gold-PRF modulus p = 2^384 - 573*2^128 + 1 — matching the
@@ -16,10 +17,11 @@
 # λ=128 post-quantum security level as the field-size choice targets — the
 # code's own internal `LAMBDA` macro, 192 here, is an unrelated
 # output-batching count, not this security parameter). This is a local
-# addition to the submodule (committed in `d-OPRF`'s own git history, never
-# pushed upstream) — the vendored code only ships 64/128/192/256/512-bit
-# fields. A small instrumentation addition to `network-version/server.c`
-# (also local-only) reports the offline phase's real cost (see below).
+# patch on top of upstream Legendre-dOPRF-network, applied directly to the
+# vendored source here (upstream itself only ships 64/128/192/256/512-bit
+# fields, and never received this patch). A small instrumentation addition
+# to `network-version/server.c` (also local-only) reports the offline
+# phase's real cost (see below).
 #
 # Usage:
 #   ./run_legendre_baseline.sh [--tn T,N] [--m 1|100|1,100]
@@ -58,8 +60,8 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SUBMODULE_ROOT="$REPO_ROOT/d-OPRF"
-DOPRF_DIR="$SUBMODULE_ROOT/Legendre-dOPRF-network"
+DOPRF_ROOT="$REPO_ROOT/d-OPRF"
+DOPRF_DIR="$DOPRF_ROOT/Legendre-dOPRF-network"
 HEADER_FILE="$DOPRF_DIR/dOPRF.h"
 JOB_TMP="${CLAUDE_JOB_DIR:-/tmp}/tmp"
 mkdir -p "$JOB_TMP" 2>/dev/null || JOB_TMP="$(mktemp -d)"
@@ -113,19 +115,19 @@ else
 fi
 
 if [ ! -d "$DOPRF_DIR" ]; then
-    echo "error: $DOPRF_DIR not found — is the d-OPRF submodule checked out? (git submodule update --init)" >&2
+    echo "error: $DOPRF_DIR not found — this should be part of a normal clone of this repo (d-OPRF/ is vendored, not a submodule); re-clone if it's missing." >&2
     exit 1
 fi
 if [ ! -f "$DOPRF_DIR/p384/generic/arith_generic.c" ]; then
-    echo "error: $DOPRF_DIR/p384 not found — the local 384-bit field addition is missing from this submodule checkout." >&2
+    echo "error: $DOPRF_DIR/p384 not found — the local 384-bit field patch is missing from this checkout." >&2
     exit 1
 fi
 
 # ---------------------------------------------------------------------------
 # Cleanup: kill any still-alive server PIDs from the current cell, then
-# always restore the submodule to its committed baseline (undoing the
+# always restore the vendored tree to its committed baseline (undoing the
 # dOPRF.h sed-patch and any binary-rebuild diff — both git-tracked in this
-# submodule) and remove untracked cruft the servers write into their cwd
+# repo) and remove untracked cruft the servers write into their cwd
 # (`server_offline_*.txt`, `server_tpsetup_bytes_*.txt`,
 # `server_reindex_bytes_*.txt` — the last two are this wrapper's own
 # instrumentation output, read by `run_one_query` before cleanup runs).
@@ -142,16 +144,16 @@ kill_tracked_servers() {
 final_cleanup() {
     kill_tracked_servers
     pkill -f "$DOPRF_DIR/server384" 2>/dev/null
-    git -C "$SUBMODULE_ROOT" checkout -- Legendre-dOPRF-network 2>/dev/null
-    git -C "$SUBMODULE_ROOT" clean -fd Legendre-dOPRF-network >/dev/null 2>&1
+    git -C "$DOPRF_ROOT" checkout -- Legendre-dOPRF-network 2>/dev/null
+    git -C "$DOPRF_ROOT" clean -fd Legendre-dOPRF-network >/dev/null 2>&1
 }
 trap final_cleanup EXIT
 
 # Pre-cleanup: clear any stray servers left running from a prior interrupted
 # invocation before we start.
 pkill -f "$DOPRF_DIR/server384" 2>/dev/null
-git -C "$SUBMODULE_ROOT" checkout -- Legendre-dOPRF-network 2>/dev/null
-git -C "$SUBMODULE_ROOT" clean -fd Legendre-dOPRF-network >/dev/null 2>&1
+git -C "$DOPRF_ROOT" checkout -- Legendre-dOPRF-network 2>/dev/null
+git -C "$DOPRF_ROOT" clean -fd Legendre-dOPRF-network >/dev/null 2>&1
 
 # ---------------------------------------------------------------------------
 # Build for (t, n): sed-patch CONST_T/CONST_N/ADVERSARY into dOPRF.h (same
