@@ -31,16 +31,23 @@ pub struct VitHParams {
 
 impl VitHParams {
     pub fn new(tau: usize, kappa: usize) -> Self {
-        let log_tau = (tau as f64).log2().ceil() as usize;
-        let repetitions = (kappa + log_tau - 1) / log_tau;
+        // One repetition has soundness error 2/τ: the QuickSilver check is a
+        // degree-2 polynomial identity in Δ ∈ [τ], and a cheating prover can
+        // place both of its roots in [τ]. Each repetition therefore gives
+        // log2(τ) − 1 bits, and (2/τ)^R ≤ 2^{-κ} needs R ≥ κ / (log2(τ) − 1).
+        assert!(tau >= 4, "VitH needs τ ≥ 4 (a repetition has soundness error 2/τ)");
+        let bits_per_rep = (tau as f64).log2() - 1.0;
+        let repetitions = (kappa as f64 / bits_per_rep).ceil() as usize;
         VitHParams { tau, kappa, repetitions }
     }
 }
 
 /// Extended witness for the dual-share circuit C_dual.
-/// Wire layout: [m_0, a_0, m_1, a_1, ..., m_{N-1}, a_{N-1}, w_0, w_1, ..., w_{N-1}]
-/// where w_0 = m_0, w_j = w_{j-1} * m_j for j >= 1.
-/// Wire 0 is reserved as the check wire (not part of the circuit).
+/// Committed wire layout: [m_0, a_0, m_1, a_1, ..., m_{N-1}, a_{N-1}, w_1, ..., w_{N-2}]
+/// where w_0 = m_0 and w_j = w_{j-1} * m_j. Neither w_0 nor w_{N-1} is a wire:
+/// gate 1 takes m_0 directly (a separate w_0 wire would be unconstrained), and
+/// the last gate's output is the linear expression Σ_k a_k + δ, which binds δ.
+/// Index 0 of the VOLE vectors is reserved as the check wire (not part of the circuit).
 #[derive(Clone, Debug)]
 pub struct ExtendedWitness {
     pub m_values: Vec<Fp>,
@@ -52,6 +59,7 @@ impl ExtendedWitness {
     pub fn new(m_values: Vec<Fp>, a_values: Vec<Fp>, _modulus: &BigUint) -> Self {
         let n = m_values.len();
         assert_eq!(n, a_values.len());
+        assert!(n >= 2, "C_dual needs N >= 2: the output constraint lives in the last gate");
 
         let mut running_products = Vec::with_capacity(n);
         running_products.push(m_values[0].clone());
@@ -62,13 +70,14 @@ impl ExtendedWitness {
         ExtendedWitness { m_values, a_values, running_products }
     }
 
-    /// Total number of circuit wires (excluding check wire): 2N + N = 3N.
+    /// Number of committed wires (excluding the check wire): 2N inputs plus
+    /// the N−2 intermediate running products w_1..w_{N-2}, i.e. 3N − 2.
     pub fn num_wires(&self) -> usize {
-        2 * self.m_values.len() + self.running_products.len()
+        3 * self.m_values.len() - 2
     }
 
     /// Flatten witness into wire vector.
-    /// Layout: [m_0, a_0, m_1, a_1, ..., w_0, w_1, ...]
+    /// Layout: [m_0, a_0, m_1, a_1, ..., w_1, ..., w_{N-2}]
     pub fn flatten(&self) -> Vec<Fp> {
         let n = self.m_values.len();
         let mut w = Vec::with_capacity(self.num_wires());
@@ -76,25 +85,15 @@ impl ExtendedWitness {
             w.push(self.m_values[i].clone());
             w.push(self.a_values[i].clone());
         }
-        for rp in &self.running_products {
+        for rp in &self.running_products[1..n - 1] {
             w.push(rp.clone());
         }
         w
     }
 
-    /// Get the multiplication gates as (a_wire_idx, b_wire_idx, c_wire_idx).
-    /// Gate j (j=1..N-1): running_products[j] = running_products[j-1] * m_values[j]
-    /// Wire indices: m_j is at 2*j, running_products[j] is at 2*N + j
-    fn gates(&self) -> Vec<(usize, usize, usize)> {
-        let n = self.m_values.len();
-        let mut gates = Vec::new();
-        for j in 1..n {
-            let a_idx = 2 * n + (j - 1); // running_products[j-1]
-            let b_idx = 2 * j;            // m_values[j]
-            let c_idx = 2 * n + j;        // running_products[j]
-            gates.push((a_idx, b_idx, c_idx));
-        }
-        gates
+    /// Multiplication gates as (left, right, output) wire indices; see `dual_gates`.
+    fn gates(&self) -> Vec<(usize, usize, Option<usize>)> {
+        dual_gates(self.m_values.len())
     }
 
     pub fn compute_delta(&self, modulus: &BigUint) -> Fp {
@@ -105,6 +104,21 @@ impl ExtendedWitness {
         }
         product - &sum
     }
+}
+
+/// The N−1 multiplication gates of C_dual over the committed wire layout
+/// (m_k at 2k, a_k at 2k+1, w_j at 2N + j − 1 for j = 1..N−2).
+/// Gate j (j = 1..N−1) checks w_{j-1} · m_j = w_j, with w_0 = m_0 read from
+/// wire 0. The last gate's output is `None`: the linear expression
+/// Σ_k a_k + δ, committed as Σ_k Commit(a_k) + δ·Δ with VOLE mask Σ_k v_{a_k}.
+fn dual_gates(n: usize) -> Vec<(usize, usize, Option<usize>)> {
+    (1..n)
+        .map(|j| {
+            let left = if j == 1 { 0 } else { 2 * n + j - 2 };
+            let out = if j == n - 1 { None } else { Some(2 * n + j - 1) };
+            (left, 2 * j, out)
+        })
+        .collect()
 }
 
 /// VOLE shares for one repetition.
@@ -252,13 +266,23 @@ impl VitHProof {
 }
 
 /// Generate a VOLEitH proof.
+///
+/// Challenge order, over one Fiat–Shamir transcript for all repetitions:
+///   1. every repetition's GGM commitment `rt` and masked witness;
+///   2. χ_ρ for every ρ, derived from (1);
+///   3. every repetition's QuickSilver check values (Ã₀, Ã₁);
+///   4. Δ_ρ for every ρ, derived from (1)+(3); only then are co-paths opened.
+/// Deriving Δ after (Ã₀, Ã₁) is essential (given Δ, anyone can satisfy the
+/// check), and deriving each family jointly prevents grinding one repetition
+/// at a time.
 pub fn vith_prove(
     witness: &ExtendedWitness,
     delta: &Fp,
     params: &VitHParams,
     modulus: &BigUint,
 ) -> VitHProof {
-    let l = witness.num_wires(); // circuit wires
+    let n = witness.m_values.len();
+    let l = witness.num_wires(); // committed circuit wires
     let l_check = l + 1;        // +1 for check wire (index 0)
     let w_flat = witness.flatten();
     let gates = witness.gates();
@@ -271,129 +295,109 @@ pub fn vith_prove(
     transcript.append_commitment(&commitment);
     transcript.append_field_element(delta);
 
-    let mut copaths = Vec::new();
-    let mut hidden_indices = Vec::new();
-    let mut masked_witnesses = Vec::new();
-    let mut check_values = Vec::new();
-    let mut seed_roots = Vec::new();
-    let mut hidden_leaf_roots = Vec::new();
-    let mut hidden_sub_tree_paths = Vec::new();
-
-    for rep in 0..params.repetitions {
-        // GGM root seed: the prover's own secret randomness, generated by a
-        // real RNG — *not* derived from the transcript. Protocol 15 line 1:
-        // "sd ← {0,1}^κ". Deriving it from public transcript data (the old
-        // code's bug) makes the entire GGM tree — including the hidden
-        // leaf's shares — publicly recomputable, breaking both
-        // zero-knowledge (the masked witness can be unmasked by anyone) and
-        // soundness (a forged witness can be solved for post hoc).
-        let mut root_seed = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut root_seed);
-
-        // Expand GGM tree and compute every leaf's share vector once.
-        let tree = GgmTree::expand(root_seed, params.tau);
-        let all_leaf_shares: Vec<Vec<Fp>> = tree
-            .leaf_seeds
-            .iter()
-            .map(|seed| leaf_shares(*seed, l_check, modulus))
-            .collect();
-
-        // Two-level GGM commitment (Section 4.2.2, our contribution): a
-        // sub-Merkle-tree over each leaf's share vector gives h_i; the
-        // outer Merkle tree over {h_i}_{i∈[τ]} gives the root `rt`. This is
-        // committed into the transcript *before* Δ is drawn (below), so
-        // altering any leaf's shares changes `rt` and hence the challenge —
-        // exactly the property the old FS-derived seed never had.
-        let leaf_roots: Vec<[u8; 32]> = all_leaf_shares
-            .iter()
-            .map(|shares| leaf_commitment_tree(shares).root())
-            .collect();
-        let outer_tree = MerkleTree::new(leaf_roots.clone());
-        let rt = outer_tree.root();
-
-        let vole = aggregate_vole_shares(&all_leaf_shares, l_check, modulus);
-
-        // Masked witness: w̃_j = w_j + u_{j+1} (shift by 1 because index 0 is check wire)
-        let masked: Vec<Fp> = (0..l)
-            .map(|j| &w_flat[j] + &vole.u[j + 1])
-            .collect();
-
-        // Sample Δ (hidden leaf) and χ (batching challenge) via Fiat-Shamir,
-        // from H(δ, rt, w̃) per Protocol 15 step 6 — rt and the masked
-        // witness are committed before Δ is drawn.
+    // (1) Per repetition: GGM tree, two-level commitment, masked witness.
+    struct Rep {
+        tree: GgmTree,
+        all_leaf_shares: Vec<Vec<Fp>>,
+        leaf_roots: Vec<[u8; 32]>,
+        rt: [u8; 32],
+        vole: VoleShares,
+        masked: Vec<Fp>,
+    }
+    let reps: Vec<Rep> = (0..params.repetitions)
+        .map(|_| {
+            // GGM root seed: the prover's own secret randomness (Protocol 16, line 1).
+            let mut root_seed = [0u8; 16];
+            rand::thread_rng().fill_bytes(&mut root_seed);
+            let tree = GgmTree::expand(root_seed, params.tau);
+            let all_leaf_shares: Vec<Vec<Fp>> = tree
+                .leaf_seeds
+                .iter()
+                .map(|seed| leaf_shares(*seed, l_check, modulus))
+                .collect();
+            // Two-level GGM commitment: a sub-Merkle root h_i per leaf, outer root rt.
+            let leaf_roots: Vec<[u8; 32]> = all_leaf_shares
+                .iter()
+                .map(|shares| leaf_commitment_tree(shares).root())
+                .collect();
+            let rt = MerkleTree::new(leaf_roots.clone()).root();
+            let vole = aggregate_vole_shares(&all_leaf_shares, l_check, modulus);
+            // Masked witness: w̃_j = w_j + u_{j+1} (shift by 1: index 0 is the check wire)
+            let masked: Vec<Fp> = (0..l).map(|j| &w_flat[j] + &vole.u[j + 1]).collect();
+            Rep { tree, all_leaf_shares, leaf_roots, rt, vole, masked }
+        })
+        .collect();
+    for (rep, r) in reps.iter().enumerate() {
         transcript.append_bytes(&(rep as u64).to_be_bytes());
-        transcript.append_commitment(&rt);
-        for mw in &masked {
+        transcript.append_commitment(&r.rt);
+        for mw in &r.masked {
             transcript.append_field_element(mw);
         }
-        transcript.append_bytes(b"hidden_leaf");
-        let hidden = transcript.challenge_index(params.tau);
-        hidden_indices.push(hidden);
+    }
 
-        transcript.append_bytes(b"chi");
-        let chi = transcript.challenge(modulus);
+    // (2) Batching challenges χ_ρ.
+    transcript.append_bytes(b"chi");
+    let chis = transcript.challenge_vec(params.repetitions, modulus);
 
-        // GGM PRG co-path: lets the verifier reconstruct every non-hidden
-        // leaf's seed (unchanged mechanism).
-        let copath = tree.copath(hidden);
-        copaths.push(copath);
+    // (3) QuickSilver check values. With Commit(w) = w·Δ − v, gate ℓ gives
+    //   B_ℓ = (a·b − c)·Δ² + (v_c − b·v_a − a·v_b)·Δ + v_a·v_b,
+    // so A₀ = Σ χ^ℓ v_a v_b and A₁ = Σ χ^ℓ (v_c − b·v_a − a·v_b). The last
+    // gate's output is Σ_k a_k + δ, whose VOLE mask is Σ_k v_{a_k} (δ is a
+    // public constant with mask 0).
+    let check_values: Vec<(Fp, Fp)> = reps
+        .iter()
+        .zip(&chis)
+        .map(|(r, chi)| {
+            let v_out = (0..n).fold(Fp::zero(modulus), |acc, k| &acc + &r.vole.v[2 * k + 2]);
+            let mut a0 = Fp::zero(modulus);
+            let mut a1 = Fp::zero(modulus);
+            let mut chi_power = Fp::one(modulus);
+            for &(a_idx, b_idx, c_idx) in &gates {
+                let a_val = &w_flat[a_idx];
+                let b_val = &w_flat[b_idx];
+                let v_a = &r.vole.v[a_idx + 1];
+                let v_b = &r.vole.v[b_idx + 1];
+                let v_c = match c_idx {
+                    Some(c) => &r.vole.v[c + 1],
+                    None => &v_out,
+                };
+                a0 = &a0 + &(&chi_power * &(v_a * v_b));
+                let a1_term = &(v_c - &(b_val * v_a)) - &(a_val * v_b);
+                a1 = &a1 + &(&chi_power * &a1_term);
+                chi_power = &chi_power * chi;
+            }
+            // Masked check values: Ã₀ = A₀ + v₀, Ã₁ = A₁ + u₀ (check wire at index 0)
+            (&a0 + &r.vole.v[0], &a1 + &r.vole.u[0])
+        })
+        .collect();
+    for (a0_tilde, a1_tilde) in &check_values {
+        transcript.append_field_element(a0_tilde);
+        transcript.append_field_element(a1_tilde);
+    }
 
-        // The hidden leaf's own sub-tree root and per-position
-        // authentication paths — this is what lets a verifier check the
-        // witness positions it holds locally against `h_Δ` (dual-share
-        // consistency, Section 4.2.2 "our contribution"). This codebase
-        // models a broadcast channel rather than a literal per-verifier P2P
-        // link, so paths for every position are included in one proof
-        // rather than targeted per recipient.
-        let hidden_tree = leaf_commitment_tree(&all_leaf_shares[hidden]);
-        seed_roots.push(rt);
-        hidden_leaf_roots.push(leaf_roots[hidden]);
+    // (4) Hidden leaves Δ_ρ, derived only now; then open.
+    transcript.append_bytes(b"hidden_leaf");
+    let hidden_indices = derive_hidden_indices(&transcript, params);
+
+    let mut copaths = Vec::with_capacity(params.repetitions);
+    let mut masked_witnesses = Vec::with_capacity(params.repetitions);
+    let mut seed_roots = Vec::with_capacity(params.repetitions);
+    let mut hidden_leaf_roots = Vec::with_capacity(params.repetitions);
+    let mut hidden_sub_tree_paths = Vec::with_capacity(params.repetitions);
+    for (r, &hidden) in reps.into_iter().zip(&hidden_indices) {
+        // GGM PRG co-path: lets the verifier reconstruct every non-hidden leaf's seed.
+        copaths.push(r.tree.copath(hidden));
+        // The hidden leaf's sub-tree root and per-position authentication
+        // paths, so each verifier can check the positions it holds against h_Δ.
+        let hidden_tree = leaf_commitment_tree(&r.all_leaf_shares[hidden]);
         hidden_sub_tree_paths.push(
             (0..l_check)
                 .map(|pos| hidden_tree.authentication_path(pos))
                 .collect(),
         );
-
-        // QuickSilver batched gate check
-        // For each multiplication gate ℓ: a^ℓ * b^ℓ = c^ℓ
-        // B_ℓ = v_a · v_b + (a·v_b + b·v_a - v_c)·Δ_hidden
-        // But we don't know Δ_hidden as a field element in the clear...
-        // Actually, the prover knows ALL leaf seeds including the hidden one,
-        // so the prover knows ALL (u_j, v_j). The prover computes A₀, A₁:
-        //   A₀ = Σ χ^ℓ · v_a^ℓ · v_b^ℓ
-        //   A₁ = Σ χ^ℓ · (v_c^ℓ - b^ℓ·v_a^ℓ - a^ℓ·v_b^ℓ)
-        // Note: sign on A₁ follows the paper: A₁ contributes with +Δ, and
-        // the gate check is A₀ + A₁·Δ = 0 when gates are satisfied.
-
-        let mut a0 = Fp::zero(modulus);
-        let mut a1 = Fp::zero(modulus);
-        let mut chi_power = Fp::one(modulus);
-
-        for &(a_idx, b_idx, c_idx) in &gates {
-            // Wire values (from witness)
-            let a_val = &w_flat[a_idx];
-            let b_val = &w_flat[b_idx];
-            // VOLE v values (shifted by 1 for check wire)
-            let v_a = &vole.v[a_idx + 1];
-            let v_b = &vole.v[b_idx + 1];
-            let v_c = &vole.v[c_idx + 1];
-
-            // A₀ += χ^ℓ · v_a · v_b
-            a0 = &a0 + &(&chi_power * &(v_a * v_b));
-            // A₁ += χ^ℓ · (v_c - b·v_a - a·v_b)
-            let a1_term = &(v_c - &(b_val * v_a)) - &(a_val * v_b);
-            a1 = &a1 + &(&chi_power * &a1_term);
-
-            chi_power = &chi_power * &chi;
-        }
-
-        // Masked check values: Ã₀ = A₀ + v₀, Ã₁ = A₁ + u₀
-        // where (u₀, v₀) are the check wire's VOLE shares
-        let a0_tilde = &a0 + &vole.v[0]; // v₀ is at index 0 (check wire)
-        let a1_tilde = &a1 + &vole.u[0]; // u₀ is at index 0
-
-        masked_witnesses.push(masked);
-        check_values.push((a0_tilde, a1_tilde));
+        hidden_leaf_roots.push(r.leaf_roots[hidden]);
+        seed_roots.push(r.rt);
+        masked_witnesses.push(r.masked);
     }
 
     VitHProof {
@@ -406,6 +410,17 @@ pub fn vith_prove(
         hidden_leaf_roots,
         hidden_sub_tree_paths,
     }
+}
+
+/// Δ_ρ for every repetition, from the transcript after all check values.
+fn derive_hidden_indices(transcript: &Transcript, params: &VitHParams) -> Vec<usize> {
+    (0..params.repetitions)
+        .map(|rep| {
+            let mut t = transcript.clone();
+            t.append_bytes(&(rep as u64).to_be_bytes());
+            t.challenge_index(params.tau)
+        })
+        .collect()
 }
 
 /// Verify a VOLEitH proof.
@@ -426,39 +441,53 @@ pub fn vith_verify(
     params: &VitHParams,
     modulus: &BigUint,
 ) -> bool {
-    // Reconstruct transcript
+    let reps = params.repetitions;
+    if proof.masked_witnesses.len() != reps
+        || proof.check_values.len() != reps
+        || proof.copaths.len() != reps
+        || proof.hidden_indices.len() != reps
+        || proof.seed_roots.len() != reps
+        || proof.hidden_leaf_roots.len() != reps
+        || proof.hidden_sub_tree_paths.len() != reps
+    {
+        return false;
+    }
+
+    // Replay the transcript in the prover's order (see `vith_prove`):
+    // commitments and masked witnesses → χ_ρ → check values → Δ_ρ.
     let mut transcript = Transcript::new(b"VitH");
     transcript.append_commitment(&proof.commitment);
     transcript.append_field_element(delta);
-
-    for rep in 0..params.repetitions {
-        if rep >= proof.seed_roots.len()
-            || rep >= proof.hidden_leaf_roots.len()
-            || rep >= proof.hidden_sub_tree_paths.len()
-        {
-            return false;
-        }
-
-        let masked = &proof.masked_witnesses[rep];
-        let l = masked.len();
-        let l_check = l + 1;
-
-        // Re-derive Δ and χ from H(δ, rt, w̃) — rt must be appended before
-        // the masked witness, matching `vith_prove`'s commit order.
+    for rep in 0..reps {
         transcript.append_bytes(&(rep as u64).to_be_bytes());
         transcript.append_commitment(&proof.seed_roots[rep]);
-        for mw in masked {
+        for mw in &proof.masked_witnesses[rep] {
             transcript.append_field_element(mw);
         }
-        transcript.append_bytes(b"hidden_leaf");
-        let expected_hidden = transcript.challenge_index(params.tau);
-        if proof.hidden_indices[rep] != expected_hidden {
+    }
+    transcript.append_bytes(b"chi");
+    let chis = transcript.challenge_vec(reps, modulus);
+    for (a0_tilde, a1_tilde) in &proof.check_values {
+        transcript.append_field_element(a0_tilde);
+        transcript.append_field_element(a1_tilde);
+    }
+    transcript.append_bytes(b"hidden_leaf");
+    let expected_hidden = derive_hidden_indices(&transcript, params);
+    if proof.hidden_indices != expected_hidden {
+        return false;
+    }
+
+    for rep in 0..reps {
+        let masked = &proof.masked_witnesses[rep];
+        let l = masked.len();
+        // Committed layout has 3N − 2 wires with N ≥ 2 (see `ExtendedWitness`).
+        if l < 4 || (l + 2) % 3 != 0 {
             return false;
         }
-        let hidden = expected_hidden;
-
-        transcript.append_bytes(b"chi");
-        let chi = transcript.challenge(modulus);
+        let n_subsets = (l + 2) / 3;
+        let l_check = l + 1;
+        let hidden = expected_hidden[rep];
+        let chi = &chis[rep];
 
         // Reconstruct revealed leaf seeds from co-path
         let revealed = GgmTree::reconstruct_except(
@@ -525,45 +554,29 @@ pub fn vith_verify(
 
         // Reconstruct VOLE tags: q_j = Σ_{i≠Δ} s_j^(i) · (Δ - i)
         let q = reconstruct_vole_tags(&revealed, hidden, l_check, modulus);
-
-        // Compute wire commitments from masked witness:
-        // Commit(w_j) = w̃_j · Δ_fp - q_{j+1}
-        // where Δ_fp is the hidden leaf index as a field element
         let delta_fp = Fp::new(BigUint::from(hidden), modulus);
+        // Commit(w_j) = w̃_j · Δ − q_{j+1} = w_j · Δ − v_j
+        let commit = |j: usize| &(&masked[j] * &delta_fp) - &q[j + 1];
+        // Output of the last gate: Commit(Σ_k a_k + δ) = Σ_k Commit(a_k) + δ·Δ
+        let commit_out = (0..n_subsets).fold(delta * &delta_fp, |acc, k| &acc + &commit(2 * k + 1));
 
-        // Reconstruct the witness structure to get gate indices
-        // We need to know which wires are gate inputs/outputs.
-        // For N subsets: 2N input wires + N running product wires = 3N total
-        // Gates: for j=1..N-1, gate (2N+j-1, 2j, 2N+j)
-        let n_subsets = l / 3; // l = 3N
-        let mut gates = Vec::new();
-        for j in 1..n_subsets {
-            gates.push((2 * n_subsets + j - 1, 2 * j, 2 * n_subsets + j));
-        }
-
-        // QuickSilver verification:
-        // V = Σ χ^ℓ B_ℓ where B_ℓ = Commit(a^ℓ)·Commit(b^ℓ) - Commit(c^ℓ)·Δ_fp
+        // QuickSilver: V = Σ χ^ℓ B_ℓ with B_ℓ = Commit(a)·Commit(b) − Commit(c)·Δ
         let mut v_check = Fp::zero(modulus);
         let mut chi_power = Fp::one(modulus);
-
-        for &(a_idx, b_idx, c_idx) in &gates {
-            // Commit(w_j) = w̃_j · Δ_fp - q_{j+1}
-            let commit_a = &(&masked[a_idx] * &delta_fp) - &q[a_idx + 1];
-            let commit_b = &(&masked[b_idx] * &delta_fp) - &q[b_idx + 1];
-            let commit_c = &(&masked[c_idx] * &delta_fp) - &q[c_idx + 1];
-
-            // B_ℓ = Commit(a) · Commit(b) - Commit(c) · Δ_fp
-            let b_ell = &(&commit_a * &commit_b) - &(&commit_c * &delta_fp);
-
+        for (a_idx, b_idx, c_idx) in dual_gates(n_subsets) {
+            let commit_c = match c_idx {
+                Some(c) => commit(c),
+                None => commit_out.clone(),
+            };
+            let b_ell = &(&commit(a_idx) * &commit(b_idx)) - &(&commit_c * &delta_fp);
             v_check = &v_check + &(&chi_power * &b_ell);
-            chi_power = &chi_power * &chi;
+            chi_power = &chi_power * chi;
         }
 
-        // Check: V + q₀ = Ã₀ + Ã₁·Δ_fp
+        // Check: V + q₀ = Ã₀ + Ã₁·Δ
         let (ref a0_tilde, ref a1_tilde) = proof.check_values[rep];
-        let lhs = &v_check + &q[0]; // V + q₀
-        let rhs = a0_tilde + &(a1_tilde * &delta_fp); // Ã₀ + Ã₁·Δ
-
+        let lhs = &v_check + &q[0];
+        let rhs = a0_tilde + &(a1_tilde * &delta_fp);
         if lhs != rhs {
             return false;
         }
@@ -598,15 +611,15 @@ mod tests {
         let delta = w.compute_delta(&p);
         assert_eq!(delta.value, BigUint::from(45u32));
 
-        assert_eq!(w.num_wires(), 9);
+        assert_eq!(w.num_wires(), 7); // 2N inputs + the N−2 = 1 intermediate product
 
         // Check gates
         let gates = w.gates();
         assert_eq!(gates.len(), 2); // N-1 = 2 gates
-        // Gate 0: rp[0] * m[1] = rp[1] → (6, 2, 7)
-        assert_eq!(gates[0], (6, 2, 7));
-        // Gate 1: rp[1] * m[2] = rp[2] → (7, 4, 8)
-        assert_eq!(gates[1], (7, 4, 8));
+        // Gate 0: m[0] * m[1] = rp[1] (wire 6) → (0, 2, Some(6))
+        assert_eq!(gates[0], (0, 2, Some(6)));
+        // Gate 1: rp[1] * m[2] = Σ a + δ (linear output) → (6, 4, None)
+        assert_eq!(gates[1], (6, 4, None));
     }
 
     #[test]
@@ -741,15 +754,16 @@ mod tests {
         let w_honest = ExtendedWitness::new(m.clone(), a.clone(), &p);
         let delta = w_honest.compute_delta(&p);
 
-        // Tampered witness: wrong running product
+        // Tampered witness: wrong intermediate running product (rp[2] is no
+        // longer a wire: the last gate outputs Σ a + δ instead)
         let mut w_bad = w_honest.clone();
-        w_bad.running_products[2] = Fp::new(BigUint::from(99u32), &p); // should be 105
+        w_bad.running_products[1] = Fp::new(BigUint::from(99u32), &p); // should be 15
 
         let params = VitHParams::new(4, 8);
         let proof = vith_prove(&w_bad, &delta, &params, &p);
 
         let local_shares = BTreeMap::new();
-        // Should fail because gate check rp[1]*m[2] != rp[2]
+        // Should fail because m[0]*m[1] != rp[1] and rp[1]*m[2] != Σ a + δ
         assert!(!vith_verify(&proof, &delta, &local_shares, &params, &p));
     }
 
@@ -777,5 +791,106 @@ mod tests {
 
         let local_shares = BTreeMap::new();
         assert!(vith_verify(&proof, &delta, &local_shares, &params, &p));
+    }
+
+    fn random_witness(n: usize, p: &BigUint) -> ExtendedWitness {
+        let mut rng = rand::thread_rng();
+        let m = (0..n).map(|_| Fp::random(p, &mut rng)).collect();
+        let a = (0..n).map(|_| Fp::random(p, &mut rng)).collect();
+        ExtendedWitness::new(m, a, p)
+    }
+
+    /// Every input-wire position, as the union of honest verifiers holds them.
+    fn input_shares(w: &ExtendedWitness) -> BTreeMap<usize, Fp> {
+        w.flatten().into_iter().take(2 * w.m_values.len()).enumerate().collect()
+    }
+
+    /// Z1: δ is bound to the witness through the last gate.
+    #[test]
+    fn test_vith_rejects_wrong_delta() {
+        let p = BigUint::from(2305843009213693951u64); // 2^61 − 1
+        let w = random_witness(10, &p);
+        let delta = w.compute_delta(&p);
+        let params = VitHParams::new(16, 40);
+        let local = input_shares(&w);
+        assert!(vith_verify(&vith_prove(&w, &delta, &params, &p), &delta, &local, &params, &p));
+        let wrong = &delta + &Fp::one(&p);
+        let proof = vith_prove(&w, &wrong, &params, &p);
+        assert!(!vith_verify(&proof, &wrong, &local, &params, &p));
+    }
+
+    /// Z1: gate 1 reads m_0 directly, so the product chain cannot start from a
+    /// free value chosen to hit a false δ.
+    #[test]
+    fn test_vith_rejects_product_chain_not_anchored_at_m0() {
+        let p = BigUint::from(2305843009213693951u64);
+        let w = random_witness(3, &p);
+        let wrong = &w.compute_delta(&p) + &Fp::one(&p);
+        // Choose w_1 so that the last gate w_1 · m_2 = Σ a + wrong holds.
+        let sum_a = w.a_values.iter().fold(Fp::zero(&p), |acc, a| &acc + a);
+        let mut bad = w.clone();
+        bad.running_products[1] = &(&sum_a + &wrong) * &w.m_values[2].inv().unwrap();
+        let params = VitHParams::new(16, 40);
+        let proof = vith_prove(&bad, &wrong, &params, &p);
+        assert!(!vith_verify(&proof, &wrong, &input_shares(&w), &params, &p));
+    }
+
+    /// Z2: (Ã₀, Ã₁) enter the hash that yields Δ, so recomputing them from the
+    /// published Δ, which forged a false witness before the fix, now fails.
+    #[test]
+    fn test_vith_rejects_check_values_forged_from_published_delta() {
+        let p = BigUint::from(2305843009213693951u64);
+        let w = random_witness(10, &p);
+        let delta = w.compute_delta(&p);
+        let mut bad = w.clone();
+        bad.running_products[4] = &bad.running_products[4] + &Fp::one(&p);
+        let params = VitHParams::new(16, 40);
+        let local = input_shares(&w);
+        let mut proof = vith_prove(&bad, &delta, &params, &p);
+        assert!(!vith_verify(&proof, &delta, &local, &params, &p));
+
+        // Recompute V + q₀ from public proof data under the published Δ_ρ and
+        // set (Ã₀, Ã₁) = (V + q₀, 0).
+        let mut tr = Transcript::new(b"VitH");
+        tr.append_commitment(&proof.commitment);
+        tr.append_field_element(&delta);
+        for rep in 0..params.repetitions {
+            tr.append_bytes(&(rep as u64).to_be_bytes());
+            tr.append_commitment(&proof.seed_roots[rep]);
+            for mw in &proof.masked_witnesses[rep] {
+                tr.append_field_element(mw);
+            }
+        }
+        tr.append_bytes(b"chi");
+        let chis = tr.challenge_vec(params.repetitions, &p);
+        for rep in 0..params.repetitions {
+            let masked = proof.masked_witnesses[rep].clone();
+            let n = (masked.len() + 2) / 3;
+            let hidden = proof.hidden_indices[rep];
+            let revealed = GgmTree::reconstruct_except(&proof.copaths[rep], hidden, params.tau);
+            let q = reconstruct_vole_tags(&revealed, hidden, masked.len() + 1, &p);
+            let d = Fp::new(BigUint::from(hidden), &p);
+            let commit = |j: usize| &(&masked[j] * &d) - &q[j + 1];
+            let out = (0..n).fold(&delta * &d, |acc, k| &acc + &commit(2 * k + 1));
+            let (mut v, mut cp) = (Fp::zero(&p), Fp::one(&p));
+            for (ia, ib, ic) in dual_gates(n) {
+                let cc = ic.map_or(out.clone(), |c| commit(c));
+                v = &v + &(&cp * &(&(&commit(ia) * &commit(ib)) - &(&cc * &d)));
+                cp = &cp * &chis[rep];
+            }
+            proof.check_values[rep] = (&v + &q[0], Fp::zero(&p));
+        }
+        assert!(!vith_verify(&proof, &delta, &local, &params, &p));
+    }
+
+    /// Z3: a repetition has soundness error 2/τ, so R·(log2 τ − 1) ≥ κ.
+    #[test]
+    fn test_vith_repetitions_cover_two_roots() {
+        assert_eq!(VitHParams::new(16, 40).repetitions, 14);
+        assert_eq!(VitHParams::new(4, 8).repetitions, 8);
+        for (tau, kappa) in [(4usize, 40usize), (8, 40), (16, 40), (32, 40), (256, 128)] {
+            let r = VitHParams::new(tau, kappa).repetitions as f64;
+            assert!(r * ((tau as f64).log2() - 1.0) >= kappa as f64);
+        }
     }
 }

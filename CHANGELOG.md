@@ -103,3 +103,22 @@ The naive Boyle+AlyGen baseline is now wired through the same Π_Input-verified 
 The `(7,2)` point (communication is almost entirely field elements) lands on 4/3 to within 0.2 %, `(4,1)` sits ~1.8 % below, the difference being fixed-size framing (party indices, subset representations, TCP/serialization headers) that does not scale with element width. As a cross-check, running the *actual* 512-bit binary instead gives `(1,4) m=1 = 5996 KB ≈ recode × (4/3)²` — because in the real code `NBYTES_FIELD` *and* `LAMBDA` both scale with bit-width.
 
 **Not a regression.** The corrected figures are the faithful instantiation of the `|p| = 384` claim the paper already makes. The originally submitted communication was inflated by 4/3. Despite that, no comparison in §Evaluation changes — Legendre still loses by orders of magnitude on communication (≈ 1.3 GB at `t = 2`, ≈ 132 GB at `m = 100`).
+
+## Group J — Offline: VitH soundness fix (δ binding, challenge ordering, corrected repetition count)
+
+**Files:** `crates/offline/src/zkp_vith.rs`
+
+**What was wrong (three findings, one circuit).** `δ` was never checked by a gate — the multiplication chain only constrained the running-product wires, and `δ` entered solely through the Fiat-Shamir hash, so a prover could start the chain from any value that hits a false `δ`. Separately, `Δ` (the hidden GGM leaf) was derived from the transcript *before* the QuickSilver check values `(Ã₀, Ã₁)` were appended, so anyone could recompute `V + q₀` from the public proof under a published `Δ` and forge `(Ã₀, Ã₁)` post hoc; challenges were also hashed per repetition, allowing one repetition to be ground at a time. Finally, the repetition count used `R = ⌈κ / log₂τ⌉`, i.e. treated the per-repetition soundness error as `1/τ`, when the QuickSilver check is degree 2 in `Δ` and a cheating prover can plant both roots in `[τ]`, giving error `2/τ`. For `τ=16, κ=40` the code computed `R=10`; the paper's own evaluation text already states `R=⌈40/3⌉=14` — the implementation had drifted from the paper, this isn't a new parameter choice.
+
+**The fix.** The last gate's output is now the linear expression `Σ_k a_k + δ`, committed as `Σ_k Commit(a_k) + δ·Δ` with VOLE mask `Σ_k v_{a_k}`; gate 1 reads `m_0` directly instead of through a previously-unconstrained `w_0` wire (committed wires: `3N → 3N − 2`). The Fiat-Shamir transcript is now one joint sequence over all repetitions — `rt, w̃ → χ_ρ → (Ã₀,Ã₁) → Δ_ρ` — with co-paths opened only after `Δ_ρ` is fixed. `VitHParams::new` now computes `R = ⌈κ / (log₂τ − 1)⌉`, so `τ=16, κ=40` gives `R=14`.
+
+**Effect on the reported numbers.** Re-measured every `Π_ZKPGen^VitH` cell (offline table) and `Π_dVOPRF^VitH` cell (e2e table) across all four `(n,t)` and both `m`; round counts are exactly unchanged (all `R` repetitions are still batched into one broadcast), and total communication grows between 1.12× (smallest instance) and 1.39× (largest), tracking the wire-count decrease (`3N→3N−2`, a bigger relative saving at small `N`) against the repetition-count increase (`R: 10→14`, a bigger relative cost as fixed overhead shrinks):
+
+| point | old Total | new Total | ratio |
+|---|---|---|---|
+| offline (3,1) m=1     | 27.92 KB       | 32.30 KB       | 1.157 |
+| offline (9,4) m=100   | 766 822.57 KB  | 1 066 289.72 KB| 1.391 |
+| e2e (3,1) m=1         | 35.56 KB       | 39.94 KB       | 1.123 |
+| e2e (9,4) m=100       | 769 264.36 KB  | 1 068 731.54 KB| 1.389 |
+
+AlyGen, DegGen, Ligero, naive-dVOPRF and the Legendre baseline are untouched by this fix and were not re-run.
