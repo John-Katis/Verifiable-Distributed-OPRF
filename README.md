@@ -4,6 +4,8 @@ Nan Cheng, Yugo Kasashima, Yohei Watanabe, Ioannis Katis, Aikaterini Mitrokotsa
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22704868.svg)](https://doi.org/10.5281/zenodo.22704868)
 
+The full paper can be found [here](https://eprint.iacr.org/2026/1953).
+
 Rust prototype implementation of the verifiable distributed OPRF protocols described in the paper (v-dOPRF), plus the external Legendre-dOPRF baseline of Kaluđerović et al (ESORICS 2025) used in the evaluation.
 
 ## Layout
@@ -53,7 +55,7 @@ Everything here runs on a single machine — `SimulatedNetwork` counts bytes/rou
 
 **2. Rust toolchain.** A `rust-toolchain.toml` pins `1.87.0` (what this artifact was built/tested with); `rustup` will fetch it automatically on first `cargo build`/`cargo run` in this directory. Needed for every experiment.
 
-**3. C toolchain + BLAKE3 — only needed for the `e2e`/`all`/`legendre-dOPRF` endpoints** (anything that touches the external Legendre-dOPRF baseline). The Rust-only endpoints (`offline`, `online`, `our-protocol-verified-input`, `naive-boyle-aly`, or `cargo run` directly) don't need this. `run_legendre_baseline.sh` rebuilds the baseline's C client/server on every invocation (`make clean && make client384 server384`), which requires `gcc`, `make`, and the BLAKE3 C library installed system-wide:
+**3. C toolchain + BLAKE3 — needed for the `e2e`/`all`/`legendre-dOPRF` endpoints** (anything that touches the external Legendre-dOPRF baseline). The Rust-only endpoints (`offline`, `online`, `our-protocol-verified-input`, `naive-boyle-aly`, or `cargo run` directly) don't need this. `run_legendre_baseline.sh` rebuilds the baseline's C client/server on every invocation (`make clean && make client384 server384`), which requires `gcc`, `make`, and the BLAKE3 C library installed system-wide:
 
 ```bash
 # Debian/Ubuntu
@@ -67,8 +69,6 @@ sudo cmake --install /tmp/BLAKE3/build
 ```
 
 (macOS: `brew install blake3`. See `d-OPRF/Legendre-dOPRF-network/README.md` for the upstream instructions this is adapted from.)
-
-**4. Python** is *not* required for reproduction — nothing on the `run_bench.sh`/`run_legendre_baseline.sh` path invokes Python. (`d-OPRF/Legendre-dOPRF-network/measure_offline.py` is a standalone helper the vendored tree ships but this artifact doesn't call.)
 
 ## Running the benchmarks
 
@@ -94,7 +94,7 @@ There are six named Rust experiments (case-sensitive, exact strings), plus one m
 | `online` | Online phase only, standalone — VIP-ComputeBatch vs. Boyle-Batch (both Π_Input-verified). |
 | `e2e` | End-to-end — offline approaches II/III-a/III-b combined with our online protocol, plus the naive Boyle+AlyGen baseline, all in one table (4 rows per `m`). |
 | `our-protocol-verified-input` | Currently produces the exact same table as `e2e` (there's only one benched "our protocol" variant right now) — kept as its own explicit name for discoverability. |
-| `naive-boyle-aly` | Just the naive Boyle+AlyGen baseline in isolation (offline AlyGen + online Boyle) — no offline II/III-a/III-b rows. |
+| `naive-boyle-aly` | Just the naive Boyle+AlyGen baseline in isolation (offline AlyGen + online Boyle), Π_Input-verified. |
 | `all` | **`offline` + `online` + `e2e`, run one after another** — every table above, in one invocation. |
 
 **The seventh endpoint, `legendre-dOPRF`, is the external Legendre-dOPRF baseline** (Kaluđerović et al., ESORICS 2025, vendored in `d-OPRF/`) — it's not one of the six Rust `Experiment` names above (it's a different program entirely, run via `./run_legendre_baseline.sh`, with its own `--tn` flag instead of `--n`/`--t` (see its own subsection below). `./run_bench.sh e2e` and `./run_bench.sh all` run it automatically as a trailing section since it's the closest external comparison point for an end-to-end query. It's not run alongside `offline`/`online` (which have no counterpart in Legendre-dOPRF to compare against) unless you call `./run_bench.sh legendre-dOPRF` directly.
