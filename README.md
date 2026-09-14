@@ -1,10 +1,11 @@
 # Supplementary code artifact for CCS submission: High-throughput Verifiable Distributed OPRF from Gold PRF
 
-Nan Cheng, Yugo Kasashima, Yohei Watanabe, Ioannis Katis, Aikaterini Mitrokotsa
+Authors: Nan Cheng, Yugo Kasashima, Yohei Watanabe, Ioannis Katis, Aikaterini Mitrokotsa
+
+Links to code artifact and full paper:
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22704868.svg)](https://doi.org/10.5281/zenodo.22704868)
-
-The full paper can be found [here](https://eprint.iacr.org/2026/1953).
+[![ePrint](https://img.shields.io/badge/IACR%20ePrint-2026%2F1953-blue)](https://eprint.iacr.org/2026/1953)
 
 Rust prototype implementation of the verifiable distributed OPRF protocols described in the paper (v-dOPRF), plus the external Legendre-dOPRF baseline of Kaluđerović et al (ESORICS 2025) used in the evaluation.
 
