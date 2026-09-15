@@ -104,21 +104,60 @@ The `(7,2)` point (communication is almost entirely field elements) lands on 4/3
 
 **Not a regression.** The corrected figures are the faithful instantiation of the `|p| = 384` claim the paper already makes. The originally submitted communication was inflated by 4/3. Despite that, no comparison in §Evaluation changes — Legendre still loses by orders of magnitude on communication (≈ 1.3 GB at `t = 2`, ≈ 132 GB at `m = 100`).
 
-## Group J — Offline: VitH soundness fix (δ binding, challenge ordering, corrected repetition count)
+## Group J — Offline: VitH soundness fix (δ binding, challenge ordering, repetition count) + shared per-verifier/verdict-echo fix
 
-**Files:** `crates/offline/src/zkp_vith.rs`
+**Files:** `crates/offline/src/zkp_vith.rs`, `crates/offline/src/approach_iii.rs`
 
-**What was wrong (three findings, one circuit).** `δ` was never checked by a gate — the multiplication chain only constrained the running-product wires, and `δ` entered solely through the Fiat-Shamir hash, so a prover could start the chain from any value that hits a false `δ`. Separately, `Δ` (the hidden GGM leaf) was derived from the transcript *before* the QuickSilver check values `(Ã₀, Ã₁)` were appended, so anyone could recompute `V + q₀` from the public proof under a published `Δ` and forge `(Ã₀, Ã₁)` post hoc; challenges were also hashed per repetition, allowing one repetition to be ground at a time. Finally, the repetition count used `R = ⌈κ / log₂τ⌉`, i.e. treated the per-repetition soundness error as `1/τ`, when the QuickSilver check is degree 2 in `Δ` and a cheating prover can plant both roots in `[τ]`, giving error `2/τ`. For `τ=16, κ=40` the code computed `R=10`; the paper's own evaluation text already states `R=⌈40/3⌉=14` — the implementation had drifted from the paper, this isn't a new parameter choice.
+**What was wrong (five findings, two shared with Ligero).** `δ` was never checked by a gate — the multiplication chain only constrained the running-product wires, and `δ` entered solely through the Fiat-Shamir hash, so a prover could start the chain from any value that hits a false `δ`. `Δ` (the hidden GGM leaf) was derived from the transcript *before* the QuickSilver check values `(Ã₀, Ã₁)` were appended, and challenges were hashed per repetition rather than jointly — together letting a prover forge `(Ã₀, Ã₁)` post hoc and grind one repetition at a time. The repetition count used `R = ⌈κ / log₂τ⌉`, treating the per-repetition soundness error as `1/τ`, when the QuickSilver check is degree 2 in `Δ` and a cheating prover can plant both roots in `[τ]` (error `2/τ`): for `τ=16, κ=40` the code computed `R=10` against the paper's own stated `R=14` — the implementation had drifted from the paper. Even after that formula is fixed, `R` was still being sized off the statistical parameter `κ=40` rather than the computational `λ=128`, and since `Δ` is a hash-derived challenge over only `τ=16` values, a prover could re-randomize its commitment and re-hash to grind it offline; an unused `commitment = H(witness)` field was also transcript-appended and wire-cost-counted despite never being independently re-verifiable. Finally, `gen_zkp` (`approach_iii.rs`) only ever re-verified *one* representative non-dealer party per proof, even though the module's design intends every server to independently re-run the public verifier — most non-dealer parties' checks were silently never executed — and there was no verdict-echo round, so a corrupted dealer could send inconsistent per-verifier material and split honest servers into different verdicts; this last pair of issues is shared with Ligero (Group K).
 
-**The fix.** The last gate's output is now the linear expression `Σ_k a_k + δ`, committed as `Σ_k Commit(a_k) + δ·Δ` with VOLE mask `Σ_k v_{a_k}`; gate 1 reads `m_0` directly instead of through a previously-unconstrained `w_0` wire (committed wires: `3N → 3N − 2`). The Fiat-Shamir transcript is now one joint sequence over all repetitions — `rt, w̃ → χ_ρ → (Ã₀,Ã₁) → Δ_ρ` — with co-paths opened only after `Δ_ρ` is fixed. `VitHParams::new` now computes `R = ⌈κ / (log₂τ − 1)⌉`, so `τ=16, κ=40` gives `R=14`.
+**The fix.** The last gate's output is now the linear expression `Σ_k a_k + δ`, committed as `Σ_k Commit(a_k) + δ·Δ` with VOLE mask `Σ_k v_{a_k}` (committed wires: `3N → 3N − 2`). The Fiat-Shamir transcript is now one joint sequence over all repetitions — `rt, w̃ → χ_ρ → (Ã₀,Ã₁) → Δ_ρ` — with co-paths opened only after `Δ_ρ` is fixed. `VitHParams::new` now computes `R = ⌈λ / (log₂τ − 1)⌉` off a renamed `lambda` field (call sites switched from `KAPPA` to the pre-existing `LAMBDA=128` constant), so `τ=16, λ=128 → R=43`; the dead `commitment` field is removed. `approach_iii.rs` now loops over every non-dealer verifier (not just the first), giving each its own independently-derived local shares and its own genuine P2P payload (VitH's authentication path, or Ligero's `q_j` binding polynomial — Group K), and adds one verdict-echo round where servers broadcast accept/reject and abort on disagreement — shared by all dealers in a `gen_zkp` call, regardless of `(n,t)` or `m`.
 
-**Effect on the reported numbers.** Re-measured every `Π_ZKPGen^VitH` cell (offline table) and `Π_dVOPRF^VitH` cell (e2e table) across all four `(n,t)` and both `m`; round counts are exactly unchanged (all `R` repetitions are still batched into one broadcast), and total communication grows between 1.12× (smallest instance) and 1.39× (largest), tracking the wire-count decrease (`3N→3N−2`, a bigger relative saving at small `N`) against the repetition-count increase (`R: 10→14`, a bigger relative cost as fixed overhead shrinks):
+**Effect on the reported numbers.** Re-measured every `Π_ZKPGen^VitH` cell (offline table) and `Π_dVOPRF^VitH` cell (e2e table) across all four `(n,t)` and both `m`, combining the circuit fix, the `λ`-based `R`, and the per-verifier/verdict-echo change into one final set of numbers. Round counts go up by exactly 1 everywhere — only the verdict echo touches round count; the circuit and `R` fixes don't. Total communication grows 2.4–4.2×, driven by `R: 10→43` and by every non-dealer party now genuinely receiving its own P2P payload instead of one shared stand-in. Computation grows far more, dominated by `vith_verify`'s GGM-leaf reconstruction now being re-run once per non-dealer party (`n−1` times) instead of once:
 
-| point | old Total | new Total | ratio |
-|---|---|---|---|
-| offline (3,1) m=1     | 27.92 KB       | 32.30 KB       | 1.157 |
-| offline (9,4) m=100   | 766 822.57 KB  | 1 066 289.72 KB| 1.391 |
-| e2e (3,1) m=1         | 35.56 KB       | 39.94 KB       | 1.123 |
-| e2e (9,4) m=100       | 769 264.36 KB  | 1 068 731.54 KB| 1.389 |
+| point | old Total | old Rnds | final Total | final Rnds | Total ratio | final Comp (ms) |
+|---|---|---|---|---|---|---|
+| offline (3,1) m=1   | 27.92 KB       | 10 | 77.55 KB        | 11 | 2.777 | 29.2      |
+| offline (9,4) m=100 | 766 822.57 KB  | 14 | 3 240 809.36 KB | 15 | 4.226 | 598 505.5 |
+| e2e (3,1) m=1        | 35.56 KB       | 19 | 85.19 KB        | 20 | 2.396 | 30.1      |
+| e2e (9,4) m=100      | 769 264.36 KB  | 23 | 3 243 251.21 KB | 24 | 4.216 | 616 425.4 |
 
-AlyGen, DegGen, Ligero, naive-dVOPRF and the Legendre baseline are untouched by this fix and were not re-run.
+Full per-`(n,t)`, per-`m` breakdown of the final numbers (all Total in KB, Comp in ms):
+
+| (n,t) | m | offline Total | offline Rnds | offline Comp | e2e Total | e2e Rnds | e2e Comp |
+|---|---|---|---|---|---|---|---|
+| (3,1) | 1   | 77.55        | 11 | 29.2      | 85.19        | 20 | 30.1      |
+| (3,1) | 100 | 6 763.92     | 11 | 1 896.2   | 6 827.11     | 20 | 1 934.5   |
+| (5,2) | 1   | 766.17       | 13 | 198.8     | 820.11       | 22 | 208.5     |
+| (5,2) | 100 | 61 216.18    | 13 | 16 500.2  | 61 414.09    | 22 | 16 768.2  |
+| (7,3) | 1   | 5 916.80     | 13 | 1 121.1   | 6 181.37     | 22 | 1 183.2   |
+| (7,3) | 100 | 439 915.21   | 13 | 102 036.1 | 440 564.05   | 22 | 103 534.4 |
+| (9,4) | 1   | 43 534.42    | 15 | 6 375.1   | 44 784.29    | 24 | 6 738.1   |
+| (9,4) | 100 | 3 240 809.36 | 15 | 598 505.5 | 3 243 251.21 | 24 | 616 425.4 |
+
+AlyGen, DegGen, naive-dVOPRF and the Legendre baseline are untouched by these fixes and were not re-run. Ligero is affected by the same `approach_iii.rs` fix — see Group K.
+
+## Group K — Offline: Ligero redesign and the shared per-verifier/verdict-echo fix
+
+**Files:** `crates/offline/src/zkp_ligero.rs`, `crates/offline/src/approach_iii.rs`, `crates/bench/src/main.rs`
+
+**What was wrong (four findings).** `Π_Lig` at the prior commit had no zero-knowledge padding: each data row was exactly the degree-`(N−1)` interpolant of its `N` witness values, so a single opened extension column was a fixed public linear combination of all `N` values — enough for a colluding coalition to recover the one share pair only the honest dealer knew. The soundness bound only accounted for the constraint test, omitted the proximity test entirely, and didn't match the degree bounds a fix would need. Query points were sampled from a small range without first committing to per-verifier binding-polynomial digests, and sized for the statistical `κ=40` rather than the computational `λ=128`, so a prover could re-randomize its commitment and re-hash to steer the sample. And the one binding check that did exist, `ligero_verify_partial_opening`, checked a claimed share value's Merkle membership at a witness position entirely independently of the codeword/constraint checks (which only ever sampled extension positions) — confirmed dead code, never actually called from `approach_iii.rs` (which sent a zero-filled placeholder instead) — so nothing tied a server's shares to the polynomial the dealer actually committed to; a proof for `delta+1` verified while every server's own check still passed.
+
+**The fix.** A near-total redesign implementing the "balanced layout" protocol: `B` instances are grouped into segments of `c`, each segment holding four length-`L=cN` rows (`M`, `a`, running product, running sum) interpolated over a subgroup `H` with **fresh uniform random padding** on the unused positions of `H` (opened columns are now provably uniform, so zero knowledge no longer limits how many points can be sampled). One mask row `Z_j = Z_W·g_j` is added per verifier plus one shared blinding row, replacing the old two-level share/private Merkle split with a flat single-level leaf. The constraint system (`h1..h5`, routed through `Z_E`/`Z_{W\S}`/`Z_{W\E}`) and the corrected two-term soundness bound (proximity test + constraint/binding-identity test) drive a new layout-search (`try_new_layout`) over both the domain size `k'` and the query count `q`. Every party gets a private **binding polynomial** `q_j`, sent P2P only (never broadcast — broadcasting it would let any recipient evaluate it at a position it doesn't hold and learn a linear relation on the hidden witness); its digest `h_j` is committed and appended to the transcript **before** query points are sampled (sampling now depends on the binding-polynomial digests, not just the row/composition commitments). Verification splits into `ligero_verify` (the shared proximity/constraint/consistency checks every party runs identically) and a new `ligero_verify_as_party` (every party checks its own `q_j` against the shared opened columns *and* against its own locally-known shares at the positions it actually holds — the missing link that ties a server's input to the codewords the dealer committed to). `ligero_verify_partial_opening` is deleted. `approach_iii.rs` now builds `verifier_positions` for every party (not one fixed representative) and sends every party its own real `q_j` over P2P; the shared per-verifier and verdict-echo fix described in Group J applies here too — `ligero_verify_as_party` is now run for every non-dealer party, not one representative, plus the same one-round verdict echo.
+
+**Effect on the reported numbers.** Re-measured every `Π_ZKPGen^Lig` cell (offline table) and `Π_dVOPRF^Lig` cell (e2e table) at `(7,3)` and `(9,4)`, both `m`. Round counts go up by 1 everywhere (verdict echo, shared with Group J). Total communication grows 1.2–2.3× (padding, mask rows, and per-party binding polynomials all add data); computation grows much more (12–30×), dominated by the new `O(n_c log n_c)` NTT-based row encoding at `n_c=16384` (up from a much smaller `n_c` before) and by `ligero_verify_as_party` now running per non-dealer party instead of once:
+
+| (n,t) | m | old offline Total | new offline Total | ratio | old Rnds | new Rnds | new offline Comp (ms) |
+|---|---|---|---|---|---|---|---|
+| (7,3) | 1   | 1 625.65 KB   | 3 789.78 KB  | 2.331 | 12 | 13 | 4 894.6   |
+| (7,3) | 100 | 3 814.65 KB   | 8 464.07 KB  | 2.219 | 12 | 13 | 87 954.0  |
+| (9,4) | 1   | 11 426.13 KB  | 13 936.19 KB | 1.220 | 14 | 15 | 11 304.4  |
+| (9,4) | 100 | 21 087.96 KB  | 35 931.50 KB | 1.704 | 14 | 15 | 461 238.3 |
+
+| (n,t) | m | old e2e Total | new e2e Total | ratio | old Rnds | new Rnds | new e2e Comp (ms) |
+|---|---|---|---|---|---|---|---|
+| (7,3) | 1   | 1 890.23 KB  | 4 054.36 KB  | 2.145 | 21 | 22 | 4 964.2   |
+| (7,3) | 100 | 4 463.45 KB  | 9 112.87 KB  | 2.042 | 21 | 22 | 88 994.0  |
+| (9,4) | 1   | 12 676.01 KB | 15 186.07 KB | 1.198 | 23 | 24 | 11 618.3  |
+| (9,4) | 100 | 23 529.77 KB | 38 373.28 KB | 1.631 | 23 | 24 | 472 811.0 |
+
+`(3,1)` and `(5,2)` Ligero rows are omitted from these tables, matching the paper's own `N<20` policy (see above). AlyGen, DegGen, VitH (covered in Group J), naive-dVOPRF and the Legendre baseline are untouched by this redesign and were not re-run.

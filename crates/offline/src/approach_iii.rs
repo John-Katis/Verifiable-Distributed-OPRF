@@ -11,9 +11,15 @@
 //!    proof; the combined verdict is the AND of all per-server, per-proof
 //!    verifications plus the server-verified DZKP verdict.
 //! 5. After verification, servers multiply all dealer contributions.
+//! 6. Servers echo their local accept/reject verdict and abort on any
+//!    disagreement (one extra round, shared by all dealers) — otherwise a
+//!    corrupted dealer could send the per-verifier P2P material (VitH's
+//!    hidden-leaf paths, Ligero's `q_j`) inconsistently and split honest
+//!    servers into different verdicts, which the ideal `F_DualShareZKP`
+//!    functionality (paper Fig. 5) rules out by construction.
 
 use num_bigint::BigUint;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use vdoprf_field::Fp;
 use vdoprf_network::CommStats;
 use vdoprf_ss::{SubsetFamily, SubsetT, RssShare};
@@ -21,14 +27,37 @@ use crate::double_rand::{generate_double_sharing, DoubleShareLocal};
 use crate::dzkp::{dzkp_compute_batch, DzkpResult};
 use crate::rss_mul::{rss_mul_all_parties_with_record, MulRecord};
 use crate::zkp_vith::{self, VitHParams, ExtendedWitness};
-use crate::zkp_ligero::{self, LigeroParams, WitnessMatrix};
+use crate::zkp_ligero::{self, LigeroInstance, LigeroLayout, LigeroParams};
 use crate::PreSharedMaterial;
 
 /// ZKP variant selection.
 #[derive(Clone, Debug)]
 pub enum ZkpVariant {
     VitH(VitHParams),
-    Ligero(LigeroParams),
+    Ligero(LigeroParams, LigeroLayout),
+}
+
+/// For every party `v`, the wire positions (indices into `dealer_subsets`)
+/// that `v` also independently holds — i.e. `T in dealer_subsets` with
+/// `v not in T`. Purely structural (derivable from the subset family alone),
+/// used to build each `LigeroInstance`'s `verifier_positions`.
+fn compute_verifier_positions(
+    dealer_subsets: &[SubsetT],
+    family: &SubsetFamily,
+    n: usize,
+) -> Vec<Vec<usize>> {
+    (0..n)
+        .map(|v| {
+            let v_subsets: HashSet<SubsetT> =
+                family.subsets_not_containing(v).into_iter().cloned().collect();
+            dealer_subsets
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| v_subsets.contains(*t))
+                .map(|(idx, _)| idx)
+                .collect()
+        })
+        .collect()
 }
 
 /// Result of Approach III across any number of offline phases.
@@ -76,9 +105,18 @@ pub fn gen_zkp(
 
     let mut alpha_es: Vec<Fp> = Vec::with_capacity(exponents.len());
     let mut result_shares_per_phase: Vec<Vec<RssShare>> = Vec::with_capacity(exponents.len());
-    // Accumulated across all phases for cross-phase Ligero batching.
-    let mut all_ligero_witnesses: Vec<WitnessMatrix> = Vec::new();
-    let mut all_ligero_deltas: Vec<Fp> = Vec::new();
+    // Accumulated across all phases for cross-phase Ligero batching. A fixed
+    // representative party (never a dealer, when one exists) stands in for
+    // "every non-dealer server" in the single simulated `ligero_verify_as_party`
+    // call after the batch, mirroring VitH's per-dealer representative pattern.
+    let mut all_ligero_instances: Vec<LigeroInstance> = Vec::new();
+    // `all_ligero_local_shares_by_party[party][instance]` — every party's
+    // OWN independently-derived view of instance `instance`'s witness
+    // positions (empty when `party` was that instance's dealer). Indexed by
+    // party rather than a single fixed representative so every non-dealer
+    // party is actually re-verified below (see module doc bullet 4/6).
+    let mut all_ligero_local_shares_by_party: Vec<Vec<BTreeMap<usize, (Fp, Fp)>>> =
+        vec![Vec::new(); n];
     let mut all_mul_records: Vec<MulRecord> = Vec::new();
     let mut tree_counter = COUNTER_TREE_BASE;
     // Tree-multiplication rounds for phase k accumulate into `tree_phase_comm`
@@ -153,7 +191,6 @@ pub fn gen_zkp(
                     let proof = zkp_vith::vith_prove(&witness, &delta, params, modulus);
 
                     let mut broadcast_data = Vec::new();
-                    broadcast_data.extend_from_slice(&proof.commitment);
                     for rep in 0..params.repetitions {
                         for mw in &proof.masked_witnesses[rep] {
                             broadcast_data.extend_from_slice(&mw.value.to_bytes_be());
@@ -174,25 +211,24 @@ pub fn gen_zkp(
                     }
                     zkp_net.broadcast(dealer_id, broadcast_data);
 
-                    // Every server runs vith_verify independently in a real
-                    // deployment. vith_verify is deterministic in (proof,
-                    // delta, params), so all honest servers reach the same
-                    // verdict. Simulate once here — the wall-clock of a single
-                    // call equals the per-server CPU cost under the paper's
-                    // parallelism model (all servers verify concurrently).
-                    // We pick the first non-dealer party as "the" verifier
-                    // this single call stands in for.
-                    let verifier_id = (0..n).find(|&v| v != dealer_id).unwrap_or(dealer_id);
-
-                    // Step 5.5 (dual-share consistency input): the positions
-                    // this verifier holds locally are exactly the subsets in
-                    // its own RSS view that also appear in the dealer's
-                    // witness — i.e. T ∈ dealer_subsets with verifier_id ∉ T.
-                    // Reproduces the dealer's own (m_T, a_T) derivation
-                    // (same PRF, same counters, same rejection sampling)
-                    // from the verifier's independent view of the shared key.
-                    let mut local_shares: BTreeMap<usize, Fp> = BTreeMap::new();
-                    if verifier_id != dealer_id {
+                    // Every non-dealer server independently re-runs
+                    // vith_verify against its OWN locally-held witness
+                    // positions — not just one arbitrary representative. A
+                    // corrupted dealer's witness can be consistent with one
+                    // verifier's positions while diverging from another's
+                    // (Section 4.2.2's security argument relies on *every*
+                    // input-wire holder independently checking; skipping all
+                    // but one representative silently drops that coverage).
+                    for verifier_id in (0..n).filter(|&v| v != dealer_id) {
+                        // Step 5.5 (dual-share consistency input): the
+                        // positions this verifier holds locally are exactly
+                        // the subsets in its own RSS view that also appear in
+                        // the dealer's witness — i.e. T ∈ dealer_subsets with
+                        // verifier_id ∉ T. Reproduces the dealer's own
+                        // (m_T, a_T) derivation (same PRF, same counters,
+                        // same rejection sampling) from the verifier's
+                        // independent view of the shared key.
+                        let mut local_shares: BTreeMap<usize, Fp> = BTreeMap::new();
                         let verifier_subsets: Vec<SubsetT> = family
                             .subsets_not_containing(verifier_id)
                             .into_iter()
@@ -217,37 +253,79 @@ pub fn gen_zkp(
                             local_shares.insert(2 * idx, m_t.pow(e));
                             local_shares.insert(2 * idx + 1, prf.evaluate(a_counter, modulus));
                         }
-                    }
 
-                    // P2P: the sub-tree authentication paths this verifier
-                    // actually needs for the positions in `local_shares`,
-                    // across every repetition — genuine data, not a
-                    // zero-filled placeholder.
-                    let mut path_data = Vec::new();
-                    for rep in 0..params.repetitions {
-                        for &position in local_shares.keys() {
-                            let wire_idx = position + 1;
-                            if let Some(path) = proof.hidden_sub_tree_paths[rep].get(wire_idx) {
-                                for node in path {
-                                    path_data.extend_from_slice(node);
+                        // P2P: this verifier's own sub-tree authentication
+                        // paths for exactly the positions in its
+                        // `local_shares`, across every repetition — genuine,
+                        // per-recipient data (previously the same clone was
+                        // sent to every party regardless of which positions
+                        // it actually holds).
+                        let mut path_data = Vec::new();
+                        for rep in 0..params.repetitions {
+                            for &position in local_shares.keys() {
+                                let wire_idx = position + 1;
+                                if let Some(path) = proof.hidden_sub_tree_paths[rep].get(wire_idx) {
+                                    for node in path {
+                                        path_data.extend_from_slice(node);
+                                    }
                                 }
                             }
                         }
-                    }
-                    for v in 0..n {
-                        if v != dealer_id {
-                            zkp_net.send_p2p(dealer_id, v, path_data.clone());
+                        zkp_net.send_p2p(dealer_id, verifier_id, path_data);
+
+                        if !zkp_vith::vith_verify(&proof, &delta, &local_shares, params, modulus) {
+                            verdict = DzkpResult::Abort;
                         }
                     }
-
-                    if !zkp_vith::vith_verify(&proof, &delta, &local_shares, params, modulus) {
-                        verdict = DzkpResult::Abort;
-                    }
                 }
-                ZkpVariant::Ligero(_) => {
-                    let witness = WitnessMatrix::new(m_values.clone(), a_values.clone(), modulus);
-                    all_ligero_witnesses.push(witness);
-                    all_ligero_deltas.push(delta.clone());
+                ZkpVariant::Ligero(_, _) => {
+                    let verifier_positions = compute_verifier_positions(&dealer_subsets, family, n);
+
+                    // Every party's own locally-known shares for THIS
+                    // instance, reproducing its independent PRF-based
+                    // derivation exactly like the VitH branch does (same
+                    // PRF, same counters, same rejection sampling). This
+                    // includes `dealer_id` itself: `compute_verifier_positions`
+                    // (and hence the prover's own mask/Λ construction) treats
+                    // the dealer as holding EVERY position of its own
+                    // instance — `family.subsets_not_containing(dealer_id)`
+                    // *is* `dealer_subsets` — so giving the dealer an empty
+                    // map here would mismatch what the proof actually
+                    // encodes and false-abort on an honest proof.
+                    for party in 0..n {
+                        let mut local_shares: BTreeMap<usize, (Fp, Fp)> = BTreeMap::new();
+                        let party_subsets: Vec<SubsetT> = family
+                            .subsets_not_containing(party)
+                            .into_iter()
+                            .cloned()
+                            .collect();
+                        for (idx, subset) in dealer_subsets.iter().enumerate() {
+                            if !party_subsets.contains(subset) {
+                                continue;
+                            }
+                            let prf = pre_shared[party]
+                                .prf_keys
+                                .get(subset)
+                                .expect("party holds PRF key for every subset in its RSS view");
+                            let mut m_t = Fp::zero(modulus);
+                            for offset in 0..REJECTION_RETRY_BUDGET as u64 {
+                                let cand = prf.evaluate(m_counter + offset, modulus);
+                                if !cand.is_zero() {
+                                    m_t = cand;
+                                    break;
+                                }
+                            }
+                            local_shares.insert(idx, (m_t.pow(e), prf.evaluate(a_counter, modulus)));
+                        }
+                        all_ligero_local_shares_by_party[party].push(local_shares);
+                    }
+
+                    all_ligero_instances.push(LigeroInstance::new(
+                        m_values.clone(),
+                        a_values.clone(),
+                        delta.clone(),
+                        verifier_positions,
+                    ));
                 }
             }
 
@@ -349,36 +427,39 @@ pub fn gen_zkp(
 
     // After all phases: for Ligero, produce ONE batched proof over all
     // N × (t+1) dealer instances, then re-verify at every server.
-    if let ZkpVariant::Ligero(params) = variant {
-        let witness_refs: Vec<&WitnessMatrix> = all_ligero_witnesses.iter().collect();
-        let proof = zkp_ligero::ligero_prove(&witness_refs, &all_ligero_deltas, params, modulus);
+    if let ZkpVariant::Ligero(params, layout) = variant {
+        let all_ligero_deltas: Vec<Fp> = all_ligero_instances.iter().map(|i| i.delta.clone()).collect();
+        let (proof, materials) = zkp_ligero::ligero_prove(&all_ligero_instances, n, params, layout, modulus);
 
         let mut broadcast_data = Vec::new();
         broadcast_data.extend_from_slice(&proof.rt_w);
         broadcast_data.extend_from_slice(&proof.rt_c);
         broadcast_data.extend_from_slice(&proof.rt_u);
-        for col in &proof.opened_columns_j {
+        for fe in &proof.u {
+            broadcast_data.extend_from_slice(&fe.value.to_bytes_be());
+        }
+        for h in &proof.h {
+            broadcast_data.extend_from_slice(h);
+        }
+        for col in &proof.opened_columns_x {
             for fe in col {
                 broadcast_data.extend_from_slice(&fe.value.to_bytes_be());
             }
         }
-        for col in &proof.opened_columns_next {
+        for col in &proof.opened_columns_etax {
             for fe in col {
                 broadcast_data.extend_from_slice(&fe.value.to_bytes_be());
             }
         }
-        for fe in &proof.opened_composition {
+        for fe in &proof.opened_composition_x {
             broadcast_data.extend_from_slice(&fe.value.to_bytes_be());
         }
-        for fe in &proof.consistency_codeword {
-            broadcast_data.extend_from_slice(&fe.value.to_bytes_be());
-        }
-        for path in &proof.merkle_paths_j {
+        for path in &proof.merkle_paths_x {
             for hash in path {
                 broadcast_data.extend_from_slice(hash);
             }
         }
-        for path in &proof.merkle_paths_next {
+        for path in &proof.merkle_paths_etax {
             for hash in path {
                 broadcast_data.extend_from_slice(hash);
             }
@@ -388,30 +469,64 @@ pub fn gen_zkp(
                 broadcast_data.extend_from_slice(hash);
             }
         }
-        for h in &proof.witness_private_hashes {
-            broadcast_data.extend_from_slice(h);
-        }
-        for path in &proof.witness_merkle_paths {
-            for hash in path {
-                broadcast_data.extend_from_slice(hash);
-            }
-        }
         zkp_net.broadcast(0, broadcast_data);
 
-        let num_queries = params.num_queries;
-        for v in 0..n {
-            if v != 0 {
-                let partial_data = vec![0u8; num_queries * 2 * feb];
-                zkp_net.send_p2p(0, v, partial_data);
+        // P2P: each party's own private binding-polynomial material (never
+        // broadcast — see zkp_ligero module doc for why).
+        for material in &materials {
+            let mut payload = Vec::with_capacity(material.q_j_coeffs.len() * feb);
+            for fe in &material.q_j_coeffs {
+                payload.extend_from_slice(&fe.value.to_bytes_be());
+            }
+            if material.party_id != 0 {
+                zkp_net.send_p2p(0, material.party_id, payload);
             }
         }
 
         // Every server runs ligero_verify independently in a real deployment.
-        // Stages 1–3 are deterministic in (proof, deltas, params); one
-        // simulated call equals the per-server CPU cost under parallelism.
-        if !zkp_ligero::ligero_verify(&proof, &all_ligero_deltas, params, modulus) {
+        // The shared proximity/constraint/consistency checks are deterministic
+        // in (proof, deltas, params, layout); one simulated call equals the
+        // per-server CPU cost under parallelism.
+        if !zkp_ligero::ligero_verify(&proof, &all_ligero_deltas, n, params, layout, modulus) {
             verdict = DzkpResult::Abort;
         }
+
+        // The Z7 fix's actual input-binding check: EVERY party verifies its
+        // own q_j against its own locally-known shares — not just one fixed
+        // representative (see module doc bullet 4/6: a corrupted dealer can
+        // target the P2P-delivered `q_j` of specific parties, so every
+        // holder of a witness position must independently check).
+        for party in 0..n {
+            if !zkp_ligero::ligero_verify_as_party(
+                party,
+                &proof,
+                &materials[party],
+                &all_ligero_local_shares_by_party[party],
+                &all_ligero_deltas,
+                n,
+                params,
+                layout,
+                modulus,
+            ) {
+                verdict = DzkpResult::Abort;
+            }
+        }
+    }
+
+    // Step 6: verdict echo. Every server has now independently computed its
+    // own accept/reject verdict for every dealer proof above; it broadcasts
+    // that verdict and aborts on any disagreement. Without this round, a
+    // corrupted dealer could send inconsistent per-verifier P2P material
+    // (VitH's hidden-leaf paths, Ligero's q_j) and split honest servers into
+    // different verdicts — which F_DualShareZKP (paper Fig. 5) rules out by
+    // definition, but which the per-server checks above don't rule out on
+    // their own without this explicit consensus step. One extra round,
+    // shared by all dealers, mirroring Π_Input's Step 4 / Π^m_dVOPRF's
+    // Step 6 echo-and-abort-on-mismatch pattern.
+    zkp_net.next_round();
+    let verdict_byte = matches!(verdict, DzkpResult::Accept) as u8;
+    for v in 0..n {
+        zkp_net.broadcast(v, vec![verdict_byte]);
     }
 
     // Aggregate ZKP + phase communication + single server-verified DZKP.
@@ -437,7 +552,91 @@ pub fn gen_zkp(
 mod tests {
     use super::*;
     use crate::setup_pre_shared;
+    use vdoprf_crypto::prg::ReplicatedPrf;
     use vdoprf_ss::ReplicatedSharing;
+
+    /// Regression for the "only one representative verifier is ever
+    /// checked" gap: with n=4, t=1 there are two non-dealer parties (2, 3).
+    /// Picking a single representative via `(0..n).find(|&v| v != dealer_id)`
+    /// would, for dealer_id=0, land on party 1 — itself a dealer — and never
+    /// exercise parties 2/3 at all. Corrupt party 3's independently-derived
+    /// view of a subset it shares with dealer 0 (simulating a dealer whose
+    /// broadcast witness disagrees with what an honest holder of that
+    /// subset actually has) and confirm the combined verdict now aborts.
+    #[test]
+    fn test_approach_iii_vith_rejects_corrupted_non_representative_verifier() {
+        let n = 4;
+        let t = 1;
+        let modulus = BigUint::from(113u32);
+        let family = SubsetFamily::new(n, t);
+        let mut pre_shared = setup_pre_shared(n, t, &modulus);
+
+        let dealer_subsets: Vec<SubsetT> = family
+            .subsets_not_containing(0)
+            .into_iter()
+            .cloned()
+            .collect();
+        let corrupted_subset = dealer_subsets
+            .iter()
+            .find(|t| !t.contains(&3))
+            .expect("dealer 0 shares at least one subset with party 3")
+            .clone();
+        pre_shared[3]
+            .prf_keys
+            .insert(corrupted_subset, ReplicatedPrf::new([0xABu8; 16]));
+
+        let e = BigUint::from(4u32);
+        let variant = ZkpVariant::VitH(VitHParams::new(4, 8));
+        let (_alpha_es, result) = gen_zkp(&[e], &pre_shared, &family, &modulus, &variant);
+
+        assert_eq!(
+            result.verdict,
+            DzkpResult::Abort,
+            "party 3's independently-derived view must be checked, not just one representative"
+        );
+    }
+
+    /// Same regression for Ligero: with n=5, t=2 the non-dealer parties are
+    /// {3, 4}. The old code always picked party 3
+    /// (`(0..n).find(|&v| v >= num_dealers)`) as "the" representative and
+    /// never checked party 4. Corrupt party 4's independent view of a
+    /// subset it shares with dealer 0 and confirm the batched Ligero
+    /// verdict now aborts.
+    #[test]
+    fn test_approach_iii_ligero_rejects_corrupted_non_representative_verifier() {
+        let n = 5;
+        let t = 2;
+        let modulus = BigUint::from(65537u32);
+        let family = SubsetFamily::new(n, t);
+        let mut pre_shared = setup_pre_shared(n, t, &modulus);
+
+        let dealer_subsets: Vec<SubsetT> = family
+            .subsets_not_containing(0)
+            .into_iter()
+            .cloned()
+            .collect();
+        let corrupted_subset = dealer_subsets
+            .iter()
+            .find(|t| !t.contains(&4))
+            .expect("dealer 0 shares at least one subset with party 4")
+            .clone();
+        pre_shared[4]
+            .prf_keys
+            .insert(corrupted_subset, ReplicatedPrf::new([0xABu8; 16]));
+
+        let e = BigUint::from(4u32);
+        let n_k = family.subsets_not_containing(0).len();
+        let (params, layout) = zkp_ligero::try_new_layout(n_k, t + 1, 8, &modulus)
+            .expect("layout must be feasible for N=6, B=3");
+        let variant = ZkpVariant::Ligero(params, layout);
+        let (_alpha_es, result) = gen_zkp(&[e], &pre_shared, &family, &modulus, &variant);
+
+        assert_eq!(
+            result.verdict,
+            DzkpResult::Abort,
+            "party 4's independently-derived view must be checked, not just one representative"
+        );
+    }
 
     #[test]
     fn test_approach_iii_vith() {
@@ -475,7 +674,9 @@ mod tests {
 
         let e = BigUint::from(4u32);
         let n_k = family.subsets_not_containing(0).len();
-        let variant = ZkpVariant::Ligero(LigeroParams::new(n_k, 8, &modulus));
+        let (params, layout) = zkp_ligero::try_new_layout(n_k, t + 1, 8, &modulus)
+            .expect("layout must be feasible for N=6, B=3");
+        let variant = ZkpVariant::Ligero(params, layout);
         let (alpha_es, result) = gen_zkp(&[e], &pre_shared, &family, &modulus, &variant);
 
         assert_eq!(result.verdict, DzkpResult::Accept);
@@ -544,7 +745,9 @@ mod tests {
         let family = SubsetFamily::new(n, t);
         let pre_shared = setup_pre_shared(n, t, &modulus);
         let n_k = family.subsets_not_containing(0).len();
-        let variant = ZkpVariant::Ligero(LigeroParams::new(n_k, 8, &modulus));
+        let (params, layout) = zkp_ligero::try_new_layout(n_k, 3 * (t + 1), 8, &modulus)
+            .expect("layout must be feasible for N=6, B=9");
+        let variant = ZkpVariant::Ligero(params, layout);
 
         let exponents = vec![BigUint::from(2u32), BigUint::from(3u32), BigUint::from(5u32)];
         let (alpha_es, result) = gen_zkp(&exponents, &pre_shared, &family, &modulus, &variant);
@@ -572,9 +775,11 @@ mod tests {
         let family = SubsetFamily::new(n, t);
         let pre_shared = setup_pre_shared(n, t, &modulus);
         let n_k = family.subsets_not_containing(0).len();
-        let variant = ZkpVariant::Ligero(LigeroParams::new(n_k, 8, &modulus));
 
         for phase_count in [1usize, 100usize] {
+            let (params, layout) = zkp_ligero::try_new_layout(n_k, phase_count * (t + 1), 8, &modulus)
+                .unwrap_or_else(|| panic!("layout must be feasible for N=6, B={}", phase_count * (t + 1)));
+            let variant = ZkpVariant::Ligero(params, layout);
             let exponents: Vec<BigUint> =
                 (1..=phase_count).map(|i| BigUint::from(i as u32)).collect();
             let (alpha_es, result) = gen_zkp(&exponents, &pre_shared, &family, &modulus, &variant);

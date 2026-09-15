@@ -15,7 +15,7 @@ use num_bigint::BigUint;
 use rand::RngCore;
 use std::collections::BTreeMap;
 use vdoprf_crypto::ggm::GgmTree;
-use vdoprf_crypto::hash::{hash_commitment, hash_field_elements};
+use vdoprf_crypto::hash::hash_commitment;
 use vdoprf_crypto::merkle::MerkleTree;
 use vdoprf_crypto::prg::PairwisePrg;
 use vdoprf_crypto::transcript::Transcript;
@@ -25,20 +25,25 @@ use vdoprf_field::Fp;
 #[derive(Clone, Debug)]
 pub struct VitHParams {
     pub tau: usize,
-    pub kappa: usize,
+    /// Computational security parameter (λ). The hidden leaf Δ ranges over
+    /// only τ values and is derived by hashing (Fiat-Shamir), so it can be
+    /// ground offline by re-randomizing the commitment and re-hashing; the
+    /// repetition count must therefore be sized for λ, not the statistical
+    /// parameter κ used elsewhere in the protocol (Z6).
+    pub lambda: usize,
     pub repetitions: usize,
 }
 
 impl VitHParams {
-    pub fn new(tau: usize, kappa: usize) -> Self {
+    pub fn new(tau: usize, lambda: usize) -> Self {
         // One repetition has soundness error 2/τ: the QuickSilver check is a
         // degree-2 polynomial identity in Δ ∈ [τ], and a cheating prover can
         // place both of its roots in [τ]. Each repetition therefore gives
-        // log2(τ) − 1 bits, and (2/τ)^R ≤ 2^{-κ} needs R ≥ κ / (log2(τ) − 1).
+        // log2(τ) − 1 bits, and (2/τ)^R ≤ 2^{-λ} needs R ≥ λ / (log2(τ) − 1).
         assert!(tau >= 4, "VitH needs τ ≥ 4 (a repetition has soundness error 2/τ)");
         let bits_per_rep = (tau as f64).log2() - 1.0;
-        let repetitions = (kappa as f64 / bits_per_rep).ceil() as usize;
-        VitHParams { tau, kappa, repetitions }
+        let repetitions = (lambda as f64 / bits_per_rep).ceil() as usize;
+        VitHParams { tau, lambda, repetitions }
     }
 }
 
@@ -209,7 +214,6 @@ fn reconstruct_vole_tags(
 /// A VOLEitH proof.
 #[derive(Clone, Debug)]
 pub struct VitHProof {
-    pub commitment: [u8; 32],
     /// Masked witness: w̃_j = w_j + u_j for each circuit wire (per repetition).
     pub masked_witnesses: Vec<Vec<Fp>>,  // [rep][wire]
     /// Masked check values per repetition: (Ã₀, Ã₁)
@@ -241,12 +245,12 @@ pub struct VitHProof {
 impl VitHProof {
     /// Wire-byte size as placed on the network by the broadcast accounting in
     /// `approach_iii::gen_zkp` (VitH branch). Matches the exact byte stream
-    /// dealers push out: commitment, then per-repetition masked witnesses,
-    /// (Ã₀, Ã₁), GGM copath seeds, the two-level commitment roots, and the
-    /// hidden leaf's sub-tree authentication paths. `hidden_indices` is
-    /// re-derived from the Fiat-Shamir transcript and not sent on the wire.
+    /// dealers push out: per-repetition masked witnesses, (Ã₀, Ã₁), GGM
+    /// copath seeds, the two-level commitment roots, and the hidden leaf's
+    /// sub-tree authentication paths. `hidden_indices` is re-derived from the
+    /// Fiat-Shamir transcript and not sent on the wire.
     pub fn wire_bytes(&self, feb: usize) -> usize {
-        let mut bytes = self.commitment.len();
+        let mut bytes = 0;
         for rep in &self.masked_witnesses {
             bytes += rep.len() * feb;
         }
@@ -287,12 +291,8 @@ pub fn vith_prove(
     let w_flat = witness.flatten();
     let gates = witness.gates();
 
-    // Commit to witness
-    let commitment = hash_field_elements(&w_flat);
-
     // Fiat-Shamir transcript
     let mut transcript = Transcript::new(b"VitH");
-    transcript.append_commitment(&commitment);
     transcript.append_field_element(delta);
 
     // (1) Per repetition: GGM tree, two-level commitment, masked witness.
@@ -401,7 +401,6 @@ pub fn vith_prove(
     }
 
     VitHProof {
-        commitment,
         masked_witnesses,
         check_values,
         copaths,
@@ -454,9 +453,9 @@ pub fn vith_verify(
     }
 
     // Replay the transcript in the prover's order (see `vith_prove`):
-    // commitments and masked witnesses → χ_ρ → check values → Δ_ρ.
+    // δ, then per-repetition commitments and masked witnesses → χ_ρ → check
+    // values → Δ_ρ.
     let mut transcript = Transcript::new(b"VitH");
-    transcript.append_commitment(&proof.commitment);
     transcript.append_field_element(delta);
     for rep in 0..reps {
         transcript.append_bytes(&(rep as u64).to_be_bytes());
@@ -852,7 +851,6 @@ mod tests {
         // Recompute V + q₀ from public proof data under the published Δ_ρ and
         // set (Ã₀, Ã₁) = (V + q₀, 0).
         let mut tr = Transcript::new(b"VitH");
-        tr.append_commitment(&proof.commitment);
         tr.append_field_element(&delta);
         for rep in 0..params.repetitions {
             tr.append_bytes(&(rep as u64).to_be_bytes());
@@ -883,14 +881,16 @@ mod tests {
         assert!(!vith_verify(&proof, &delta, &local, &params, &p));
     }
 
-    /// Z3: a repetition has soundness error 2/τ, so R·(log2 τ − 1) ≥ κ.
+    /// Z3: a repetition has soundness error 2/τ, so R·(log2 τ − 1) ≥ λ.
+    /// Z6: R is sized for the computational parameter λ=128 (grinding
+    /// resistance on the hash-derived Δ), not the statistical κ=40.
     #[test]
     fn test_vith_repetitions_cover_two_roots() {
-        assert_eq!(VitHParams::new(16, 40).repetitions, 14);
+        assert_eq!(VitHParams::new(16, 128).repetitions, 43);
         assert_eq!(VitHParams::new(4, 8).repetitions, 8);
-        for (tau, kappa) in [(4usize, 40usize), (8, 40), (16, 40), (32, 40), (256, 128)] {
-            let r = VitHParams::new(tau, kappa).repetitions as f64;
-            assert!(r * ((tau as f64).log2() - 1.0) >= kappa as f64);
+        for (tau, lambda) in [(4usize, 128usize), (8, 128), (16, 128), (32, 128), (256, 128)] {
+            let r = VitHParams::new(tau, lambda).repetitions as f64;
+            assert!(r * ((tau as f64).log2() - 1.0) >= lambda as f64);
         }
     }
 }

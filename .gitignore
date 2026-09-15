@@ -4,3 +4,6 @@
 # Editor / OS cruft
 *.swp
 .DS_Store
+
+/paper-sync/
+*.tex

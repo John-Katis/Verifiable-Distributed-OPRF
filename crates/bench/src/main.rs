@@ -29,7 +29,7 @@ use vdoprf_offline::approach_iii::{self, ZkpVariant};
 use vdoprf_offline::dzkp::DzkpResult;
 use vdoprf_offline::pub_base_exp::is_coprime;
 use vdoprf_offline::setup_pre_shared;
-use vdoprf_offline::zkp_ligero::LigeroParams;
+use vdoprf_offline::zkp_ligero;
 use vdoprf_offline::zkp_vith::VitHParams;
 use vdoprf_offline::PreSharedMaterial;
 use vdoprf_online::compute_batch::VerifiedInputResult;
@@ -393,7 +393,7 @@ fn run_offline_one(
         }
         "III-a: VOLEitH" => {
             let exponents: Vec<BigUint> = (0..m).map(|_| e.clone()).collect();
-            let vith_params = VitHParams::new(TAU, KAPPA);
+            let vith_params = VitHParams::new(TAU, LAMBDA as usize);
             let avg = bench_avg(|| {
                 let t0 = Instant::now();
                 let (_alpha_es, result) = approach_iii::gen_zkp(
@@ -410,10 +410,13 @@ fn run_offline_one(
         }
         "III-b: Ligero" => {
             let dealer_wires = family.subsets_not_containing(0).len();
-            let Some(ligero_params) = LigeroParams::try_new(dealer_wires, KAPPA, modulus) else {
+            let b_total = m * (t + 1);
+            let Some((ligero_params, ligero_layout)) =
+                zkp_ligero::try_new_layout(dealer_wires, b_total, LAMBDA, modulus)
+            else {
                 return Row::skipped(n, t, m, name);
             };
-            if ligero_params.n_c > 10000 {
+            if ligero_params.n_c > 20000 {
                 return Row::skipped(n, t, m, name);
             }
             let exponents: Vec<BigUint> = (0..m).map(|_| e.clone()).collect();
@@ -424,7 +427,7 @@ fn run_offline_one(
                     pre_shared,
                     family,
                     modulus,
-                    &ZkpVariant::Ligero(ligero_params.clone()),
+                    &ZkpVariant::Ligero(ligero_params.clone(), ligero_layout.clone()),
                 );
                 let dt = t0.elapsed().as_secs_f64() * 1000.0;
                 (dt, result.comm)
@@ -620,7 +623,7 @@ fn run_offline_alpha_only(
             OfflineAlphaRun::Ok { time_ms: dt, comm: result.comm, alpha }
         }
         "III-a" => {
-            let vith_params = VitHParams::new(TAU, KAPPA);
+            let vith_params = VitHParams::new(TAU, LAMBDA as usize);
             let t0 = Instant::now();
             let (_alpha_es, result) = approach_iii::gen_zkp(
                 std::slice::from_ref(e),
@@ -635,10 +638,13 @@ fn run_offline_alpha_only(
         }
         "III-b" => {
             let dealer_wires = family.subsets_not_containing(0).len();
-            let Some(ligero_params) = LigeroParams::try_new(dealer_wires, KAPPA, modulus) else {
+            let b_total = family.t + 1;
+            let Some((ligero_params, ligero_layout)) =
+                zkp_ligero::try_new_layout(dealer_wires, b_total, LAMBDA, modulus)
+            else {
                 return OfflineAlphaRun::Skip;
             };
-            if ligero_params.n_c > 10000 {
+            if ligero_params.n_c > 20000 {
                 return OfflineAlphaRun::Skip;
             }
             let t0 = Instant::now();
@@ -647,7 +653,7 @@ fn run_offline_alpha_only(
                 pre_shared,
                 family,
                 modulus,
-                &ZkpVariant::Ligero(ligero_params),
+                &ZkpVariant::Ligero(ligero_params, ligero_layout),
             );
             let dt = t0.elapsed().as_secs_f64() * 1000.0;
             let alpha = ReplicatedSharing::from_party_shares(&result.result_shares[0]);
@@ -705,7 +711,7 @@ fn run_offline_alphas_batched(
         }
         "III-a" => {
             let exponents: Vec<BigUint> = (0..m).map(|_| e.clone()).collect();
-            let vith_params = VitHParams::new(TAU, KAPPA);
+            let vith_params = VitHParams::new(TAU, LAMBDA as usize);
             let t0 = Instant::now();
             let (_alpha_es, result) = approach_iii::gen_zkp(
                 &exponents,
@@ -722,10 +728,13 @@ fn run_offline_alphas_batched(
         }
         "III-b" => {
             let dealer_wires = family.subsets_not_containing(0).len();
-            let Some(ligero_params) = LigeroParams::try_new(dealer_wires, KAPPA, modulus) else {
+            let b_total = m * (family.t + 1);
+            let Some((ligero_params, ligero_layout)) =
+                zkp_ligero::try_new_layout(dealer_wires, b_total, LAMBDA, modulus)
+            else {
                 return OfflineAlphasRun::Skip;
             };
-            if ligero_params.n_c > 10000 {
+            if ligero_params.n_c > 20000 {
                 return OfflineAlphasRun::Skip;
             }
             let exponents: Vec<BigUint> = (0..m).map(|_| e.clone()).collect();
@@ -735,7 +744,7 @@ fn run_offline_alphas_batched(
                 pre_shared,
                 family,
                 modulus,
-                &ZkpVariant::Ligero(ligero_params),
+                &ZkpVariant::Ligero(ligero_params, ligero_layout),
             );
             let dt = t0.elapsed().as_secs_f64() * 1000.0;
             let alphas = (0..m)
@@ -1341,7 +1350,7 @@ fn main() {
     let modulus = BigUint::parse_bytes(p_hex.as_bytes(), 16).unwrap();
     let e = BigUint::one() << LAMBDA;
     let fe_bytes_val = ((modulus.bits() + 7) / 8) as usize;
-    let vith_reps = VitHParams::new(TAU, KAPPA).repetitions;
+    let vith_reps = VitHParams::new(TAU, LAMBDA as usize).repetitions;
 
     println!("================================================================");
     println!("  v-dOPRF Benchmark  (iterations = {})", BENCH_ITERS);
