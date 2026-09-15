@@ -160,4 +160,13 @@ AlyGen, DegGen, naive-dVOPRF and the Legendre baseline are untouched by these fi
 | (9,4) | 1   | 12 676.01 KB | 15 186.07 KB | 1.198 | 23 | 24 | 11 618.3  |
 | (9,4) | 100 | 23 529.77 KB | 38 373.28 KB | 1.631 | 23 | 24 | 472 811.0 |
 
-`(3,1)` and `(5,2)` Ligero rows are omitted from these tables, matching the paper's own `N<20` policy (see above). AlyGen, DegGen, VitH (covered in Group J), naive-dVOPRF and the Legendre baseline are untouched by this redesign and were not re-run.
+**Update — `(3,1)`/`(5,2)` Ligero, now included.** Per the parameter-search finding above, re-ran `Π_ZKPGen^Lig`/`Π_dVOPRF^Lig` at `(3,1)` and `(5,2)` too, both `m`, since they're no longer infeasible under the fixed protocol. Unlike `(7,3)`/`(9,4)`, Ligero is **not** competitive at these two thresholds — the fixed `n_c=16384` code length is a large cost that doesn't amortize over the small instance count `B`, so Ligero is dominated by both `Π_DegGen` and `Π_ZKPGen^VitH` on communication at every point here, and on WAN time at `m=1`. The one exception: at `m=100`, Ligero's communication already undercuts VitH's at both `(3,1)` (1 909.67 KB vs VitH's 6 763.92 KB) and `(5,2)` (3 152.11 KB vs 61 216.18 KB) — VitH's `R=43`-repetition broadcast material scales with `m` much faster than Ligero's batched, mostly-fixed-cost proof — and at `(5,2),m=100` Ligero's WAN time (20 425.4 ms offline / 21 351.8 ms e2e) actually edges out VitH's (22 815.0 ms / 23 999.2 ms) too, though `Π_DegGen` still wins outright at both thresholds. These are genuinely new table rows and figure points (not present in the original paper at all, which only ever plotted `Π_Lig` from `(7,3)` onward):
+
+| (n,t) | m | offline Total | offline Rnds | offline Comp (ms) | e2e Total | e2e Rnds | e2e Comp (ms) |
+|---|---|---|---|---|---|---|---|
+| (3,1) | 1   | 1 738.16 KB | 11 | 2 240.5  | 1 745.81 KB | 20 | 2 233.3  |
+| (3,1) | 100 | 1 909.67 KB | 11 | 6 188.7  | 1 972.85 KB | 20 | 6 214.2  |
+| (5,2) | 1   | 2 145.46 KB | 13 | 3 378.9  | 2 199.40 KB | 22 | 3 392.3  |
+| (5,2) | 100 | 3 152.11 KB | 13 | 18 867.2 | 3 350.06 KB | 22 | 18 877.4 |
+
+AlyGen, DegGen, VitH (covered in Group J), naive-dVOPRF and the Legendre baseline are untouched by this redesign and were not re-run.
