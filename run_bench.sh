@@ -7,50 +7,57 @@
 #     safely by `./run_legendre_baseline.sh` (see that script's header for
 #     why it exists rather than calling the vendored tree's own scripts).
 #
-# Usage:
-#   ./run_bench.sh
-#       No arguments: alias for `all` (below) — everything.
+# Three ways to use this script — see README.md "Which command do I run?"
+# for the full explanation:
 #
-#   ./run_bench.sh all|e2e [--n N --t T] [--m M1,M2,...]
-#       Runs the Rust harness, THEN also runs the Legendre-dOPRF baseline
-#       (both (t,n) pairs, m ∈ {1,100}) as a trailing section. `all`/`e2e`
-#       are the only two Rust experiments compared against Legendre-dOPRF,
-#       since it has no offline/online phase split of its own to compare
-#       against — only a full end-to-end query.
+#   (1) ./run_bench.sh full-version [--n N --t T] [--m M1,M2,...]
+#       Reproduces every table the *current* full version paper reports
+#       (offline Tab. 3, online Tab. 4, e2e Tab. 5) — alias for `all`.
 #
-#   ./run_bench.sh offline|online|our-protocol-verified-input|naive-boyle-aly [--n N --t T] [--m M1,M2,...]
-#       Forwards to `cargo run --release -p vdoprf-bench -- <name> [flags]`.
-#       Rust-only — no Legendre section.
+#   (2) ./run_bench.sh camera-ready [--n N --t T] [--m M1,M2,...]
+#       Reproduces just the end-to-end table the CCS camera-ready paper
+#       prints (its Table 2 — row-identical to the full version's Table 5;
+#       the camera-ready paper omits the per-phase breakdowns for space) —
+#       alias for `e2e`.
 #
-#   ./run_bench.sh legendre-dOPRF [--tn T,N] [--m 1|100|1,100]
-#       Forwards to `./run_legendre_baseline.sh [flags]`.
+#   (3) ./run_bench.sh offline|online|our-protocol-verified-input|naive-boyle-aly|legendre-dOPRF [flags]
+#       Individual benchmarking runs — one section/protocol at a time, for
+#       poking at a single row instead of reproducing a whole paper table.
 #
-#   ./run_bench.sh --help
-#       Print this message (and the Rust harness's own --help).
+# `full-version`/`all` and `camera-ready`/`e2e` additionally run the
+# external Legendre-dOPRF baseline (both (t,n) pairs, m ∈ {1,100}) as a
+# trailing section, since it's the closest external comparison point and
+# has no offline/online phase split of its own to feed into (1)/(3) alone.
+#
+# No arguments: alias for `full-version` — everything.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_ROOT"
 
 RUST_ONLY_EXPERIMENTS="offline online our-protocol-verified-input naive-boyle-aly"
-RUST_PLUS_LEGENDRE_EXPERIMENTS="all e2e"
+# `full-version`/`camera-ready` are the paper-facing aliases; `all`/`e2e`
+# are the original underlying names and keep working identically.
+RUST_PLUS_LEGENDRE_EXPERIMENTS="full-version camera-ready all e2e"
 
 usage() {
     cat <<EOF
-Usage: ./run_bench.sh [experiment] [flags]
+Usage: ./run_bench.sh [target] [flags]
 
-No arguments: alias for 'all' — everything, Rust and Legendre-dOPRF.
+No arguments: alias for 'full-version' — everything, Rust and Legendre-dOPRF.
 
-Rust + Legendre-dOPRF (Rust harness, then run_legendre_baseline.sh --m 1,100):
-  $RUST_PLUS_LEGENDRE_EXPERIMENTS
-  flags: [--n N --t T] [--m M1,M2,...]  (apply to the Rust side only)
+(1) Full paper version (offline + online + e2e tables; Rust + Legendre-dOPRF):
+  ./run_bench.sh full-version [--n N --t T] [--m M1,M2,...]
+  (alias: all)
 
-Rust-only (forwarded to 'cargo run --release -p vdoprf-bench --'):
-  $RUST_ONLY_EXPERIMENTS
-  flags: [--n N --t T] [--m M1,M2,...]
+(2) Camera-ready CCS paper (e2e table only; Rust + Legendre-dOPRF):
+  ./run_bench.sh camera-ready [--n N --t T] [--m M1,M2,...]
+  (alias: e2e)
 
-External baseline only:
-  legendre-dOPRF [--tn T,N] [--m 1|100|1,100]
+(3) Individual benchmarking runs (Rust-only, forwarded to
+    'cargo run --release -p vdoprf-bench --'):
+  ./run_bench.sh offline|online|our-protocol-verified-input|naive-boyle-aly [--n N --t T] [--m M1,M2,...]
+  ./run_bench.sh legendre-dOPRF [--tn T,N] [--m 1|100|1,100]
   (forwarded to ./run_legendre_baseline.sh)
 
   --help   print this message and exit
@@ -71,7 +78,7 @@ run_rust_plus_legendre() {
 }
 
 if [ $# -eq 0 ]; then
-    run_rust_plus_legendre all
+    run_rust_plus_legendre full-version
     exit $?
 fi
 

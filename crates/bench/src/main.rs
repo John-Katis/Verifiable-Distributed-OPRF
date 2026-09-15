@@ -1194,6 +1194,14 @@ fn run_section_naive_boyle_aly(parameter_sets: &[(usize, usize)], e2e_m: &[usize
 /// Which experiment(s) to run. Defaults to `All`, which reproduces the
 /// historical unconditional three-section run byte-for-byte when no
 /// `--n/--t/--m` overrides are given.
+///
+/// `All`/`E2e` also answer to the paper-facing aliases `full-version`/
+/// `camera-ready` (see `Experiment::parse`): `all` reproduces every table
+/// the current full version reports (offline §7.1 Tab. 3, online §7.2
+/// Tab. 4, e2e §7.3 Tab. 5), while `e2e` alone reproduces just the
+/// end-to-end table the camera-ready CCS paper prints (its Table 2, which
+/// is identical row-for-row to the full version's Table 5 — the
+/// camera-ready paper omits the per-phase breakdowns for space).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Experiment {
     All,
@@ -1207,10 +1215,10 @@ enum Experiment {
 impl Experiment {
     fn parse(s: &str) -> Option<Self> {
         match s {
-            "all" => Some(Experiment::All),
+            "all" | "full-version" => Some(Experiment::All),
             "offline" => Some(Experiment::Offline),
             "online" => Some(Experiment::Online),
-            "e2e" => Some(Experiment::E2e),
+            "e2e" | "camera-ready" => Some(Experiment::E2e),
             "our-protocol-verified-input" => Some(Experiment::OurProtocolVerifiedInput),
             "naive-boyle-aly" => Some(Experiment::NaiveBoyleAly),
             _ => None,
@@ -1227,7 +1235,15 @@ struct Cli {
 fn print_usage() {
     eprintln!("Usage: vdoprf-bench [experiment] [--n N --t T] [--m M1,M2,...]");
     eprintln!();
-    eprintln!("Experiments:");
+    eprintln!("Paper-reproduction aliases (recommended entry points):");
+    eprintln!("  full-version    = 'all' — every table the current full version reports:");
+    eprintln!("                    offline (Tab. 3) + online (Tab. 4) + e2e (Tab. 5)");
+    eprintln!("  camera-ready    = 'e2e' — just the end-to-end table the CCS camera-ready");
+    eprintln!("                    paper prints (its Table 2, row-identical to the full");
+    eprintln!("                    version's Table 5; the camera-ready paper omits the");
+    eprintln!("                    per-phase offline/online breakdowns for space)");
+    eprintln!();
+    eprintln!("Underlying experiments (same runs, original names):");
     eprintln!("  all                          (default) run every section: offline + online + e2e");
     eprintln!("  offline                      Section 1 — offline phase only, all four approaches");
     eprintln!("  online                       Section 2 — online phase standalone, VIP-ComputeBatch vs Boyle-Batch (both Π_Input-verified)");
