@@ -4,7 +4,7 @@ Authors: Nan Cheng, Yugo Kasashima, Yohei Watanabe, Ioannis Katis, Aikaterini Mi
 
 Links to code artifact and full paper:
 
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22743033.svg)](https://doi.org/10.5281/zenodo.22743033)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22765450.svg)](https://doi.org/10.5281/zenodo.22765450)
 [![ePrint](https://img.shields.io/badge/IACR%20ePrint-2026%2F1953-blue)](https://eprint.iacr.org/2026/1953)
 
 Rust prototype implementation of the verifiable distributed OPRF protocols described in the paper (v-dOPRF), plus the external Legendre-dOPRF baseline of Kaluđerović et al (ESORICS 2025) used in the evaluation.
