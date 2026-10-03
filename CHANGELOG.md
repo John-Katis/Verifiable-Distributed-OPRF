@@ -170,3 +170,37 @@ AlyGen, DegGen, naive-dVOPRF and the Legendre baseline are untouched by these fi
 | (5,2) | 100 | 3 152.11 KB | 13 | 18 867.2 | 3 350.06 KB | 22 | 18 877.4 |
 
 AlyGen, DegGen, VitH (covered in Group J), naive-dVOPRF and the Legendre baseline are untouched by this redesign and were not re-run.
+
+## Changes after CCS artifact evaluation review
+
+These two changes address the findings of the CCS 2026 artifact evaluation (review of `ccs.v1.6`). The reviewer found that (1) the `Π_DZKP^Aly` baseline does not compute the Gold PRF `F_k(x) = (x+k)^g`, and (2) the timed client routine stops at the opened value `v` without applying the final exponentiation `v^g`.
+
+### 1. `Π_AlyGen` now uses the Gold exponent `e = 2^128` unchanged
+
+**Files:** `crates/offline/src/approach_i.rs`, `crates/bench/src/main.rs`
+
+**What was wrong.** Protocol 14 of the full version (our RSS port of Aly et al.'s public-exponent protocol - now corrected) stated the precondition `gcd(e, p-1) = 1`, and the implementation enforced it in two places: `aly_gen` asserted `is_coprime(e, p-1)`, and the bench helper `aly_coprime_e` incremented `e` until the gcd was 1 before calling `aly_gen`. In the Gold setting `e | p-1` by construction, so the precondition can never hold for `e = 2^128`; for our prime `p = 2^384 − 573·2^128 + 1` the helper incremented `e` exactly once, to `e' = 2^128 + 1`. `Π_AlyGen` therefore produced `[[α^(e+1)]]` instead of `[[α^e]]`, the online phase opened `v = α^(e+1)·(x+k)`, and `v^g = α^g·(x+k)^g ≠ F_k(x)`: the mask did not cancel, so every baseline output was wrong while all proofs still accepted. The precondition is not part of Aly et al.'s protocol, which is correct for every public exponent (`c^e · g^(−e·r') = α^e`; no step inverts `e` modulo `p-1`), and nothing in our `Π_exp` implementation needs it either.
+
+**The fix.** `aly_coprime_e` is removed and the bench passes `e = 2^128` to `aly_gen` directly. The coprimality assertion in `aly_gen` is replaced by `e ≢ 0 mod p-1` (the only exponent that makes `α^e` trivial). `r'` is now sampled from `Z_{p-1} \ {0}` instead of `Z*_{p-1}`, matching Aly et al. (`find_coprime_counter` is removed; `find_nonzero_counter` is used instead). The unit test that expected non-coprime exponents to be rejected is replaced by `test_alygen_gold_exponent_dividing_p_minus_1` (an exponent dividing `p-1` yields `α^e`, and `(α^e)^((p-1)/e) = 1`, which an `e+1` substitute would fail) and `test_alygen_rejects_e_multiple_of_p_minus_1`; the two `#[ignore]`d 256-bit repro tests use `e = 2^128` directly. Because `e` is public, the message pattern of `Π_AlyGen` does not depend on its value, so communication and round counts are unchanged; the only computational difference is one fewer multiplication in each server's local `c^e` (with square-and-multiply, `2^128 + 1` costs 128 squarings plus one multiplication by `c`, `2^128` only the 128 squarings).
+
+### 2. Client-side final exponentiation `v^g` is now timed, and outputs are checked
+
+**Files:** `crates/bench/src/main.rs`
+
+**What was wrong.** The benchmarked client routines ended once the client had verified and reconstructed `v`; the local final step `v ↦ v^g` that turns `v` into the PRF output was not part of the measured scope, for any of the four constructions. The bench also never compared the client's output against the plaintext PRF value, which is why the baseline error above went unnoticed.
+
+**The fix.** Added `client_finalize`, which computes `v^g` with `g = (p-1)/2^128`, and call it inside every timed client region: both online variants (`run_online_set`) and both end-to-end variants (`run_one_e2e_iter`), so it applies to `Π_dVOPRF^DegGen`, `Π_dVOPRF^VitH`, `Π_dVOPRF^Lig` and `Π_DZKP^Aly` alike. Added `check_gold_outputs`, which runs after every end-to-end iteration (outside the timed region) and asserts that every client output equals `(x+k)^g` for the iteration's key `k` and inputs `x`. With the original `e' = 2^128 + 1`, this check fails on the first baseline output.
+
+**Effect on the reported numbers.** Re-ran the full benchmark suite with both changes. Every end-to-end iteration of all four constructions returns the correct `(x+k)^g` at every `(n,t)` and `m ∈ {1, 100}`. Communication and round counts are unchanged in every cell (the `e` fix changes no message, and `v^g` is local to the client). `v^g` costs about 20 µs per output (≈2 ms at `m = 100`). Across all end-to-end cells WAN time differs from the paper by less than 3%, and computation by at most about 4% in both directions, which is run-to-run variation, apart from cells of a few milliseconds where the absolute difference is 1–2 ms. Every ranking and ratio stated in the paper still holds. The `Π_DZKP^Aly` end-to-end cells (`Π_AlyGen` offline + `Π_naive-dVOPRF` online), paper vs. corrected:
+
+| (n,t) | m | Rnds | Total (KB) paper | Total (KB) corrected | Comp (ms) paper | Comp (ms) corrected | WAN (ms) paper | WAN (ms) corrected |
+|---|---|---|---|---|---|---|---|---|
+| (3,1) | 1   | 34 | 33.00     | 33.00     | 25.0      | 26.2      | 3 427.7  | 3 428.9  |
+| (3,1) | 100 | 34 | 622.77    | 622.77    | 149.1     | 147.8     | 3 600.2  | 3 598.8  |
+| (5,2) | 1   | 38 | 406.21    | 406.21    | 87.5      | 87.2      | 3 920.8  | 3 920.5  |
+| (5,2) | 100 | 38 | 4 713.88  | 4 713.89  | 1 179.5   | 1 217.0   | 5 365.7  | 5 403.2  |
+| (7,3) | 1   | 42 | 3 693.60  | 3 693.59  | 620.9     | 621.9     | 5 123.4  | 5 124.5  |
+| (7,3) | 100 | 42 | 30 715.07 | 30 715.10 | 34 333.0  | 34 432.4  | 41 049.2 | 41 148.6 |
+| (9,4) | 1   | 44 | 26 872.86 | 26 871.87 | 11 752.9  | 11 792.4  | 18 354.3 | 18 393.7 |
+
+`(9,4), m = 100` remains skipped for `Π_DZKP^Aly` (memory budget), as in the paper. The Legendre-dOPRF baseline is untouched by these changes and was not re-run.

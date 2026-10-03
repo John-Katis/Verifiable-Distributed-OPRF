@@ -9,7 +9,7 @@
 //!
 //! Per-phase steps (run once per exponent):
 //!
-//!  1. F_Rand → `[r']_{p-1} ∈ Z*_{p-1}` and `[[α]]_p`.
+//!  1. F_Rand → `[r']_{p-1} ∈ Z_{p-1} \ {0}` and `[[α]]_p`.
 //!  2. `[[r̄]] ← Π_exp(g, [r'])`.
 //!  3. `[[c]] ← Π_RSS.Mul([[r̄]], [[α]])`.
 //!  4. `c ← Open([[c]])`; abort if `c = 0`.
@@ -19,13 +19,13 @@
 //!  8. Local: `[[α^e]] = c' · [[ρ]]`.
 
 use num_bigint::BigUint;
-use num_traits::One;
+use num_traits::{One, Zero};
 use vdoprf_field::Fp;
 use vdoprf_ss::{SubsetFamily, RssShare};
 use crate::double_rand::{generate_double_sharing, DoubleShareLocal};
 use vdoprf_network::{CommStats, SimulatedNetwork};
 use crate::dzkp::{dzkp_compute_batch, DzkpResult};
-use crate::pub_base_exp::{is_coprime, open_rss, pub_base_exp_malicious, scalar_mul_rss};
+use crate::pub_base_exp::{open_rss, pub_base_exp_malicious, scalar_mul_rss};
 use crate::rss_mul::{rss_mul_all_parties_with_record, MulRecord};
 use crate::PreSharedMaterial;
 
@@ -69,8 +69,12 @@ pub fn aly_gen(
     assert!(!exponents.is_empty(), "aly_gen requires at least one exponent");
     assert!(generator.modulus() == modulus, "generator must be in F_p");
     let p_minus_1 = modulus - BigUint::one();
+    // Aly et al.'s public-exponent protocol is correct for every public `e`
+    // (c^e · g^{-e·r'} = α^e; nothing inverts `e` mod p-1), so no coprimality
+    // requirement. In the Gold setting `e | p-1`, so `gcd(e, p-1) = 1` never
+    // holds. Only `e ≡ 0 mod p-1` is rejected, as it makes α^e trivially 1.
     for e in exponents {
-        assert!(is_coprime(e, &p_minus_1), "Π_AlyGen requires gcd(e, p-1) = 1");
+        assert!(!(e % &p_minus_1).is_zero(), "Π_AlyGen requires e ≢ 0 mod p-1");
     }
 
     let n = family.n;
@@ -83,7 +87,7 @@ pub fn aly_gen(
         let phase_off = PHASE_STRIDE * (phase_idx as u64);
 
         // Step 1: F_Rand with phase-offset counters.
-        let (counter_r_prime, _) = find_coprime_counter(
+        let (counter_r_prime, _) = find_nonzero_counter(
             pre_shared,
             family,
             &p_minus_1,
@@ -273,22 +277,6 @@ fn reconstruct_from_prfs(
     total
 }
 
-fn find_coprime_counter(
-    pre_shared: &[PreSharedMaterial],
-    family: &SubsetFamily,
-    p_minus_1: &BigUint,
-    counter_base: u64,
-) -> Option<(u64, Fp)> {
-    for offset in 0..(REJECTION_RETRY_BUDGET as u64) {
-        let counter = counter_base + offset;
-        let r = reconstruct_from_prfs(pre_shared, family, counter, p_minus_1);
-        if !r.is_zero() && is_coprime(&r.value, p_minus_1) {
-            return Some((counter, r));
-        }
-    }
-    None
-}
-
 fn find_nonzero_counter(
     pre_shared: &[PreSharedMaterial],
     family: &SubsetFamily,
@@ -325,11 +313,7 @@ mod tests {
         );
         let pre_shared = setup_pre_shared(n, t, &modulus);
         let g = test_generator(&modulus);
-        let mut e = BigUint::one() << 128;
-        let p_minus_1 = &modulus - BigUint::one();
-        while crate::pub_base_exp::gcd(&e, &p_minus_1) != BigUint::one() {
-            e += BigUint::one();
-        }
+        let e: BigUint = BigUint::one() << 128;
         let exponents: Vec<BigUint> = (0..m).map(|_| e.clone()).collect();
         let t0 = std::time::Instant::now();
         let (_alphas, result) = aly_gen(&exponents, &pre_shared, &family, &modulus, &g);
@@ -350,8 +334,8 @@ mod tests {
         run_alygen_bench_cell(9, 4, 50);
     }
 
-    /// Reproduces the bench cell (n,t)=(7,3), m=50, 256-bit p, e = 2^128+1
-    /// (bench's `aly_coprime_e(2^128)`). Not run by default (#[ignore]).
+    /// Reproduces the bench cell (n,t)=(7,3), m=50, 256-bit p, e = 2^128
+    /// (the Gold exponent the bench uses). Not run by default (#[ignore]).
     #[test]
     #[ignore]
     fn repro_alygen_m50_7_3_256bit() {
@@ -370,14 +354,8 @@ mod tests {
         let pre_shared = setup_pre_shared(n, t, &modulus);
         let g = test_generator(&modulus);
 
-        // Bench uses `aly_coprime_e(2^128)`: smallest e ≥ 2^128 with
-        // gcd(e, p-1) = 1. Mirror that precisely.
-        let mut e = BigUint::one() << 128;
-        let p_minus_1 = &modulus - BigUint::one();
-        while crate::pub_base_exp::gcd(&e, &p_minus_1) != BigUint::one() {
-            e += BigUint::one();
-        }
-        eprintln!("e bits = {}, e coprime-nudge = {}", e.bits(), &e - (BigUint::one() << 128));
+        // Bench uses the Gold exponent e = 2^128 unchanged (e | p-1).
+        let e: BigUint = BigUint::one() << 128;
 
         let exponents: Vec<BigUint> = (0..50).map(|_| e.clone()).collect();
         let t0 = std::time::Instant::now();
@@ -510,9 +488,12 @@ mod tests {
         assert!(result.comm.total_bytes() > 0);
     }
 
+    /// Gold setting: `e | p-1` (here p = 113, p-1 = 112 = 16·7, e = 16,
+    /// g = 7). AlyGen must output α^e, so the client's final exponent
+    /// removes the mask: (α^e)^g = α^{p-1} = 1. A coprime substitute such
+    /// as e+1 would leave α^g ≠ 1 instead.
     #[test]
-    #[should_panic(expected = "gcd(e, p-1) = 1")]
-    fn test_alygen_rejects_non_coprime_e() {
+    fn test_alygen_gold_exponent_dividing_p_minus_1() {
         let n = 3;
         let t = 1;
         let modulus = BigUint::from(113u32);
@@ -520,7 +501,30 @@ mod tests {
         let pre_shared = setup_pre_shared(n, t, &modulus);
         let g = test_generator(&modulus);
 
-        let _ = aly_gen(&[BigUint::from(4u32)], &pre_shared, &family, &modulus, &g);
+        let e = BigUint::from(16u32);
+        let final_exp = BigUint::from(7u32);
+        let (alphas, result) = aly_gen(&[e.clone()], &pre_shared, &family, &modulus, &g);
+        assert_eq!(result.verdict, DzkpResult::Accept);
+
+        let reconstructed =
+            ReplicatedSharing::reconstruct_from_party_shares(&result.result_shares[0], &modulus);
+        assert_eq!(reconstructed.value, alphas[0].pow(&e).value);
+        if !alphas[0].is_zero() {
+            assert!(reconstructed.pow(&final_exp).value.is_one());
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "e ≢ 0 mod p-1")]
+    fn test_alygen_rejects_e_multiple_of_p_minus_1() {
+        let n = 3;
+        let t = 1;
+        let modulus = BigUint::from(113u32);
+        let family = SubsetFamily::new(n, t);
+        let pre_shared = setup_pre_shared(n, t, &modulus);
+        let g = test_generator(&modulus);
+
+        let _ = aly_gen(&[BigUint::from(112u32)], &pre_shared, &family, &modulus, &g);
     }
 
     /// Cross-phase batching: run 3 offline phases with different exponents.
@@ -562,7 +566,7 @@ mod tests {
 
     /// Stress: `N = 1` and `N = 100` offline phases must both produce
     /// correct `α^e` per phase and an accepting combined DZKP. Uses
-    /// `p = 65537` (p−1 = 2^16) so every odd exponent is coprime to p−1.
+    /// `p = 65537` (p−1 = 2^16) with odd exponents 1, 3, 5, ….
     #[test]
     fn test_alygen_1_and_100_phases() {
         let n = 3;

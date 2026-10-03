@@ -27,7 +27,6 @@ use vdoprf_offline::approach_i;
 use vdoprf_offline::approach_ii;
 use vdoprf_offline::approach_iii::{self, ZkpVariant};
 use vdoprf_offline::dzkp::DzkpResult;
-use vdoprf_offline::pub_base_exp::is_coprime;
 use vdoprf_offline::setup_pre_shared;
 use vdoprf_offline::zkp_ligero;
 use vdoprf_offline::zkp_vith::VitHParams;
@@ -338,15 +337,22 @@ impl SplitRow {
     }
 }
 
-/// Pick an exponent coprime to p-1 by nudging upward from `e` until
-/// gcd(e, p-1) = 1. Approach I's Protocol 17 (AlyGen) requires this.
-fn aly_coprime_e(e: &BigUint, modulus: &BigUint) -> BigUint {
-    let p_minus_1 = modulus - BigUint::one();
-    let mut candidate = e.clone();
-    while !is_coprime(&candidate, &p_minus_1) {
-        candidate += BigUint::one();
+/// Client-side final exponentiation `v ↦ v^g` with `g = (p-1)/2^λ`, turning
+/// each opened `v = α^e·(x+k)` into the Gold PRF output `(x+k)^g`. Called
+/// inside every timed client region so the reported client cost includes it.
+fn client_finalize(vs: &[Fp], modulus: &BigUint) -> Vec<Fp> {
+    let g = (modulus - BigUint::one()) >> LAMBDA;
+    vs.iter().map(|v| v.pow(&g)).collect()
+}
+
+/// End-to-end correctness check (outside the timed region): every client
+/// output must equal the plaintext Gold PRF value `(x+k)^g`.
+fn check_gold_outputs(outs: &[Fp], xs: &[Fp], k: &Fp, modulus: &BigUint, who: &str) {
+    let g = (modulus - BigUint::one()) >> LAMBDA;
+    assert_eq!(outs.len(), xs.len(), "{}: output count", who);
+    for (out, x) in outs.iter().zip(xs) {
+        assert_eq!(out.value, (x + k).pow(&g).value, "{}: output != (x+k)^g", who);
     }
-    candidate
 }
 
 // ---------------------------------------------------------------------------
@@ -368,8 +374,7 @@ fn run_offline_one(
             if aly_skip(n, t, m) {
                 return Row::skipped(n, t, m, name);
             }
-            let e_coprime = aly_coprime_e(e, modulus);
-            let exponents: Vec<BigUint> = (0..m).map(|_| e_coprime.clone()).collect();
+            let exponents: Vec<BigUint> = (0..m).map(|_| e.clone()).collect();
             let g = Fp::new(BigUint::from(3u32), modulus);
             let avg = bench_avg(|| {
                 let t0 = Instant::now();
@@ -510,7 +515,10 @@ fn run_online_set(n: usize, t: usize, m: usize, modulus: &BigUint) -> Vec<SplitR
                 }
             };
             let mut client_net = SimulatedNetwork::new(n);
-            let _outs = client_deliver_vip_batched(&r, &mut client_net, modulus);
+            let _outs = client_finalize(
+                &client_deliver_vip_batched(&r, &mut client_net, modulus),
+                modulus,
+            );
             let dt = t0.elapsed().as_secs_f64() * 1000.0;
             let mut comm = r.comm;
             comm.merge(&client_net.stats());
@@ -541,7 +549,8 @@ fn run_online_set(n: usize, t: usize, m: usize, modulus: &BigUint) -> Vec<SplitR
                 }
             };
             let mut client_net = SimulatedNetwork::new(n);
-            let _outs = client_deliver_boyle(&proof, &mut client_net, modulus);
+            let _outs =
+                client_finalize(&client_deliver_boyle(&proof, &mut client_net, modulus), modulus);
             let dt = t0.elapsed().as_secs_f64() * 1000.0;
             // Client delivery of (verdict, z_k RSS shares) is a distinct
             // round after Protocol 4.2 step 7: servers only ship outputs
@@ -605,11 +614,10 @@ fn run_offline_alpha_only(
 ) -> OfflineAlphaRun {
     match name {
         "I" => {
-            let e_coprime = aly_coprime_e(e, modulus);
             let g = Fp::new(BigUint::from(3u32), modulus);
             let t0 = Instant::now();
             let (_alphas, result) =
-                approach_i::aly_gen(&[e_coprime], pre_shared, family, modulus, &g);
+                approach_i::aly_gen(std::slice::from_ref(e), pre_shared, family, modulus, &g);
             let dt = t0.elapsed().as_secs_f64() * 1000.0;
             let alpha = ReplicatedSharing::from_party_shares(&result.result_shares[0]);
             OfflineAlphaRun::Ok { time_ms: dt, comm: result.comm, alpha }
@@ -686,8 +694,7 @@ fn run_offline_alphas_batched(
             if aly_skip(family.n, family.t, m) {
                 return OfflineAlphasRun::Skip;
             }
-            let e_coprime = aly_coprime_e(e, modulus);
-            let exponents: Vec<BigUint> = (0..m).map(|_| e_coprime.clone()).collect();
+            let exponents: Vec<BigUint> = (0..m).map(|_| e.clone()).collect();
             let g = Fp::new(BigUint::from(3u32), modulus);
             let t0 = Instant::now();
             let (_alphas, result) =
@@ -797,6 +804,7 @@ fn run_one_e2e_iter(
     // via `Π_Input` (see Section 2's cells for the same reasoning) — per
     // confirmed scope, no e2e composition benchmarks the unverified input
     // path, so there is no separate `client_to_servers_input` charge here.
+    let outs: Vec<Fp>;
     let online_comm = match online_variant {
         OnlineVariant::VipVerifiedInput => {
             let r = match compute_batch::compute_batch_with_verified_input(
@@ -808,7 +816,10 @@ fn run_one_e2e_iter(
                 }
             };
             let mut client_net = SimulatedNetwork::new(n);
-            let _outs = client_deliver_vip_batched(&r, &mut client_net, modulus);
+            outs = client_finalize(
+                &client_deliver_vip_batched(&r, &mut client_net, modulus),
+                modulus,
+            );
             let mut c = r.comm;
             c.merge(&client_net.stats());
             c
@@ -823,12 +834,14 @@ fn run_one_e2e_iter(
                 }
             };
             let mut client_net = SimulatedNetwork::new(n);
-            let _outs = client_deliver_boyle(&proof, &mut client_net, modulus);
+            outs =
+                client_finalize(&client_deliver_boyle(&proof, &mut client_net, modulus), modulus);
             c.merge(&client_net.stats());
             c
         }
     };
     let online_t = t0.elapsed().as_secs_f64() * 1000.0;
+    check_gold_outputs(&outs, xs, &k, modulus, name);
 
     let mut total = offline_comm;
     total.merge(&online_comm);

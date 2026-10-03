@@ -185,3 +185,12 @@ Examples:
 ```
 
 Runs the vendored C client/server binaries safely from outside a shell session's own working directory and restores the vendored tree to its committed baseline on exit, even on interruption.
+
+## CCS Artifact Evaluation
+
+The CCS 2026 artifact evaluation of `ccs.v1.6` found two issues, both fixed in this version. See end of [CHANGELOG.md](CHANGELOG.md#changes-after-ccs-artifact-evaluation-review) for the cause, the fix and before/after numbers for every affected cell.
+
+1. **The `Π_DZKP^Aly` baseline did not compute the Gold PRF.** The bench replaced the exponent `e = 2^128` by `e + 1` before calling `Π_AlyGen`, because of an unnecessary `gcd(e, p-1) = 1` precondition. The baseline therefore produced `α^(e+1)` instead of `α^e`, and the client's output `v^g` kept the random mask `α^g`. `Π_AlyGen` now uses `e = 2^128` unchanged.
+2. **The timed client routine stopped at the opened value `v`.** The final exponentiation `v ↦ v^g` that yields `F_k(x) = (x+k)^g` is now included in the timed client region of every online and end-to-end measurement, for all four constructions.
+
+Every end-to-end iteration now also checks each client output against the plaintext `(x+k)^g` (outside the timed region). Communication and round counts are unaffected by both fixes, and computation and WAN times stay within run-to-run variation, so every comparison in the paper still holds.
