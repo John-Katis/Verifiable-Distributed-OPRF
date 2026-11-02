@@ -19,11 +19,11 @@
 
 // Loads from system enviroment first, then set default values
 #ifndef CONST_T
-#define CONST_T 1
+#define CONST_T 2
 #endif
 
 #ifndef CONST_N
-#define CONST_N 4
+#define CONST_N 7
 #endif
 
 #define MUL_FACTOR  2

@@ -3,7 +3,9 @@
 //! Given a primitive n-th root of unity ω ∈ F_p with n a power of two,
 //! [`ntt`] computes the DFT
 //!
-//!     A_j = Σ_{i=0}^{n-1} a_i · ω^{i·j}   (j = 0..n)
+//! ```text
+//! A_j = Σ_{i=0}^{n-1} a_i · ω^{i·j}   (j = 0..n)
+//! ```
 //!
 //! in-place in O(n log n) field operations. [`intt`] is the same butterfly
 //! network driven by ω⁻¹ followed by a scale by n⁻¹.

@@ -178,7 +178,11 @@ pub fn aly_gen(
             family,
             ALYGEN_COUNTER_EXP1_BASE + phase_off,
         );
-        assert!(exp1.valid, "Π_exp #1 rejected an honest execution");
+        if !exp1.valid {
+            // Π_exp aborts with abort (Protocol 14, Step 2).
+            comm.merge(&exp1.comm);
+            return aborted(alphas, result_shares_per_phase, comm);
+        }
         let r_bar_shares = exp1.result_shares;
         mul_records.extend(exp1.mul_records);
         chain_a.merge(&exp1.comm);
@@ -207,7 +211,13 @@ pub fn aly_gen(
         let mut open_net = SimulatedNetwork::new(n);
         let c = open_rss(&c_shares, modulus, &mut open_net);
         chain_a.merge(&open_net.stats());
-        assert!(!c.is_zero(), "AlyGen abort: c = 0 (negligible for cryptographic p)");
+        if c.is_zero() {
+            // Protocol 14, Step 4: "if c = 0, abort". Happens iff α = 0
+            // (r̄ = g^{r'} ≠ 0), i.e. with probability 1/p — negligible for the
+            // 384-bit bench prime, but reachable with the small test primes.
+            comm.merge(&chain_a);
+            return aborted(alphas, result_shares_per_phase, comm);
+        }
 
         // Step 5: c' = c^e (local, depends on Chain A's opened c).
         let c_prime = c.pow(e);
@@ -225,7 +235,12 @@ pub fn aly_gen(
             family,
             ALYGEN_COUNTER_EXP2_BASE + phase_off,
         );
-        assert!(exp2.valid, "Π_exp #2 rejected an honest execution");
+        if !exp2.valid {
+            // Π_exp aborts with abort (Protocol 14, Step 6).
+            comm.merge(&chain_a);
+            comm.merge(&exp2.comm);
+            return aborted(alphas, result_shares_per_phase, comm);
+        }
         let rho_shares = exp2.result_shares;
         mul_records.extend(exp2.mul_records);
         chain_b.merge(&exp2.comm);
@@ -251,6 +266,24 @@ pub fn aly_gen(
         ApproachIResult {
             result_shares: result_shares_per_phase,
             verdict,
+            comm,
+        },
+    )
+}
+
+/// Controlled abort of Π_AlyGen: the honest parties output ⊥ instead of the
+/// process panicking. `result_shares` holds only the phases completed before
+/// the abort, so callers must check `verdict` before using it.
+fn aborted(
+    alphas: Vec<Fp>,
+    result_shares: Vec<Vec<RssShare>>,
+    comm: CommStats,
+) -> (Vec<Fp>, ApproachIResult) {
+    (
+        alphas,
+        ApproachIResult {
+            result_shares,
+            verdict: DzkpResult::Abort,
             comm,
         },
     )
@@ -301,6 +334,25 @@ mod tests {
 
     fn test_generator(modulus: &BigUint) -> Fp {
         Fp::new(BigUint::from(3u32), modulus)
+    }
+
+    /// α of phase `phase` as F_Rand derives it inside `aly_gen`.
+    fn phase_alpha(pre_shared: &[PreSharedMaterial], family: &SubsetFamily, modulus: &BigUint, phase: usize) -> Fp {
+        reconstruct_from_prfs(pre_shared, family, ALYGEN_COUNTER_ALPHA + PHASE_STRIDE * phase as u64, modulus)
+    }
+
+    /// Setup whose α is nonzero in every one of the first `phases` phases.
+    /// With the small test primes, α = 0 has probability 1/p per phase, and
+    /// Π_AlyGen then (correctly) aborts at `c = 0`; tests that expect Accept
+    /// draw a setup that avoids it. Without this, those tests fail at random.
+    fn setup_nonzero_alphas(n: usize, t: usize, modulus: &BigUint, phases: usize) -> Vec<PreSharedMaterial> {
+        let family = SubsetFamily::new(n, t);
+        loop {
+            let pre_shared = setup_pre_shared(n, t, modulus);
+            if (0..phases).all(|ph| !phase_alpha(&pre_shared, &family, modulus, ph).is_zero()) {
+                return pre_shared;
+            }
+        }
     }
 
     fn run_alygen_bench_cell(n: usize, t: usize, m: usize) {
@@ -378,7 +430,7 @@ mod tests {
         let t = 1;
         let modulus = BigUint::from(113u32);
         let family = SubsetFamily::new(n, t);
-        let pre_shared = setup_pre_shared(n, t, &modulus);
+        let pre_shared = setup_nonzero_alphas(n, t, &modulus, 1);
         let g = test_generator(&modulus);
 
         let e = BigUint::from(3u32);
@@ -402,7 +454,7 @@ mod tests {
         let t = 1;
         let modulus = BigUint::from(113u32);
         let family = SubsetFamily::new(n, t);
-        let pre_shared = setup_pre_shared(n, t, &modulus);
+        let pre_shared = setup_nonzero_alphas(n, t, &modulus, 1);
         let g = test_generator(&modulus);
 
         let e = BigUint::from(5u32);
@@ -422,7 +474,7 @@ mod tests {
         let t = 1;
         let modulus = BigUint::from(113u32);
         let family = SubsetFamily::new(n, t);
-        let pre_shared = setup_pre_shared(n, t, &modulus);
+        let pre_shared = setup_nonzero_alphas(n, t, &modulus, 1);
         let g = test_generator(&modulus);
 
         let (alphas, result) = aly_gen(&[BigUint::from(1u32)], &pre_shared, &family, &modulus, &g);
@@ -441,7 +493,7 @@ mod tests {
         let t = 2;
         let modulus = BigUint::from(113u32);
         let family = SubsetFamily::new(n, t);
-        let pre_shared = setup_pre_shared(n, t, &modulus);
+        let pre_shared = setup_nonzero_alphas(n, t, &modulus, 1);
         let g = test_generator(&modulus);
 
         let e = BigUint::from(11u32);
@@ -461,7 +513,7 @@ mod tests {
         let t = 1;
         let modulus = BigUint::from(65537u32);
         let family = SubsetFamily::new(n, t);
-        let pre_shared = setup_pre_shared(n, t, &modulus);
+        let pre_shared = setup_nonzero_alphas(n, t, &modulus, 1);
         let g = test_generator(&modulus);
 
         let e = BigUint::from(3u32);
@@ -481,7 +533,7 @@ mod tests {
         let t = 1;
         let modulus = BigUint::from(113u32);
         let family = SubsetFamily::new(n, t);
-        let pre_shared = setup_pre_shared(n, t, &modulus);
+        let pre_shared = setup_nonzero_alphas(n, t, &modulus, 1);
         let g = test_generator(&modulus);
 
         let (_, result) = aly_gen(&[BigUint::from(3u32)], &pre_shared, &family, &modulus, &g);
@@ -498,7 +550,7 @@ mod tests {
         let t = 1;
         let modulus = BigUint::from(113u32);
         let family = SubsetFamily::new(n, t);
-        let pre_shared = setup_pre_shared(n, t, &modulus);
+        let pre_shared = setup_nonzero_alphas(n, t, &modulus, 1);
         let g = test_generator(&modulus);
 
         let e = BigUint::from(16u32);
@@ -509,9 +561,7 @@ mod tests {
         let reconstructed =
             ReplicatedSharing::reconstruct_from_party_shares(&result.result_shares[0], &modulus);
         assert_eq!(reconstructed.value, alphas[0].pow(&e).value);
-        if !alphas[0].is_zero() {
-            assert!(reconstructed.pow(&final_exp).value.is_one());
-        }
+        assert!(reconstructed.pow(&final_exp).value.is_one());
     }
 
     #[test]
@@ -535,7 +585,7 @@ mod tests {
         let t = 1;
         let modulus = BigUint::from(113u32);
         let family = SubsetFamily::new(n, t);
-        let pre_shared = setup_pre_shared(n, t, &modulus);
+        let pre_shared = setup_nonzero_alphas(n, t, &modulus, 3);
         let g = test_generator(&modulus);
 
         let exponents = vec![
@@ -573,7 +623,7 @@ mod tests {
         let t = 1;
         let modulus = BigUint::from(65537u32);
         let family = SubsetFamily::new(n, t);
-        let pre_shared = setup_pre_shared(n, t, &modulus);
+        let pre_shared = setup_nonzero_alphas(n, t, &modulus, 100);
         let g = test_generator(&modulus);
 
         for phase_count in [1usize, 100usize] {
@@ -612,7 +662,7 @@ mod tests {
         let t = 1;
         let modulus = BigUint::from(113u32);
         let family = SubsetFamily::new(n, t);
-        let pre_shared = setup_pre_shared(n, t, &modulus);
+        let pre_shared = setup_nonzero_alphas(n, t, &modulus, 3);
         let g = test_generator(&modulus);
 
         let (_, three_phases) = aly_gen(
@@ -624,5 +674,26 @@ mod tests {
         );
         // Single combined DZKP verdict covers every phase's multiplications.
         assert_eq!(three_phases.verdict, DzkpResult::Accept);
+    }
+
+    /// α = 0 makes the opened c zero; Protocol 14 then aborts. This must be
+    /// a controlled `Abort` verdict, not a panic.
+    #[test]
+    fn test_alygen_aborts_when_alpha_is_zero() {
+        let n = 3;
+        let t = 1;
+        let modulus = BigUint::from(113u32);
+        let family = SubsetFamily::new(n, t);
+        // P(α = 0) = 1/113 per setup; 20 000 draws miss it with prob. < 1e-77.
+        let pre_shared = (0..20_000)
+            .map(|_| setup_pre_shared(n, t, &modulus))
+            .find(|ps| phase_alpha(ps, &family, &modulus, 0).is_zero())
+            .expect("no setup with α = 0 found");
+        let g = test_generator(&modulus);
+
+        let (alphas, result) = aly_gen(&[BigUint::from(3u32)], &pre_shared, &family, &modulus, &g);
+        assert!(alphas[0].is_zero());
+        assert_eq!(result.verdict, DzkpResult::Abort);
+        assert!(result.result_shares.is_empty());
     }
 }

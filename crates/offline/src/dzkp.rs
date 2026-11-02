@@ -24,7 +24,7 @@ use vdoprf_ss::{
 };
 use crate::rss_mul::{rss_mul_batched_all_parties_with_record, MulRecord};
 use crate::PreSharedMaterial;
-use crate::double_rand::{generate_double_sharing, generate_double_sharing_all};
+use crate::double_rand::{f_coin, generate_double_sharing, generate_double_sharing_all};
 use crate::rss_share::{charge_naive_rss_open, charge_naive_rss_share};
 
 /// Result of DZKP verification.
@@ -34,15 +34,55 @@ pub enum DzkpResult {
     Abort,
 }
 
-/// Per-server RSS shares of the four values required to verify a single
-/// DZKP instance: {q(r), f_1(r), f_2(r), σ}. The batched wrapper folds
-/// these across n parallel provers via Protocol 3.1.3's U/V/W compression.
+/// Per-server RSS shares of the values required to verify a single DZKP
+/// instance: {q(r), f_1(r), f_2(r)} and the per-fold residuals from which σ
+/// is formed. The batched wrapper folds these across n parallel provers via
+/// Protocol 3.1.3's U/V/W compression.
+///
+/// σ is deliberately *not* computed by the prover's core: its coefficients
+/// ε_k must come from F_Coin after every residual is fixed (Protocol 5
+/// step 13; BGIN20 Protocol 3.3). A prover that chose the ε_k itself could
+/// zero the coefficient of a wrong fold and pass σ = 0. The caller draws the
+/// ε_k with [`f_coin`] and combines the residuals with [`fold_sigma`].
 #[derive(Clone, Debug)]
 pub struct DzkpCoreShares {
     pub q_r: Vec<RssShare>,
     pub f1_r: Vec<RssShare>,
     pub f2_r: Vec<RssShare>,
-    pub sigma: Vec<RssShare>,
+    /// `residuals[k][i]`: party i's RSS share of `d_{k} − q_{k+1}(1) −
+    /// q_{k+1}(2)` for fold step k (the first binds the claimed c, the last
+    /// closes the base case). σ = Σ_k ε_k · residual_k.
+    pub residuals: Vec<Vec<RssShare>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: `Some((prover_id, fold_step))` makes that prover cheat in
+    /// that fold of `dzkp_core_batched` (see the negative test).
+    static TAMPER_FOLD: std::cell::Cell<Option<(usize, usize)>> = const { std::cell::Cell::new(None) };
+}
+
+/// σ = Σ_k ε_k · residual_k, re-randomised by a fresh sharing of zero.
+/// `epsilons` are F_Coin outputs drawn after all residuals are fixed.
+fn fold_sigma(
+    residuals: &[Vec<RssShare>],
+    epsilons: &[Fp],
+    n: usize,
+    family: &SubsetFamily,
+    modulus: &BigUint,
+) -> Vec<RssShare> {
+    assert_eq!(residuals.len(), epsilons.len(), "one F_Coin ε per fold residual");
+    let mut rng = rand::thread_rng();
+    let zero_sharing = share(&Fp::zero(modulus), family, modulus, &mut rng);
+    (0..n)
+        .map(|i| {
+            let mut acc = get_party_share(&zero_sharing, i, family);
+            for (res, eps) in residuals.iter().zip(epsilons) {
+                acc = acc.local_add(&res[i].local_scalar_mul(eps));
+            }
+            acc
+        })
+        .collect()
 }
 
 /// Lagrange interpolation: evaluate polynomial through given points at x.
@@ -111,10 +151,7 @@ fn dzkp_core(
     let two = Fp::new(BigUint::from(2u32), modulus);
     let three = Fp::new(BigUint::from(3u32), modulus);
 
-    let zero_sharing = share(&Fp::zero(modulus), family, modulus, &mut rng);
-    let mut sigma_shares: Vec<RssShare> = (0..n)
-        .map(|i| get_party_share(&zero_sharing, i, family))
-        .collect();
+    let mut residuals: Vec<Vec<RssShare>> = Vec::new();
 
     // d starts as the claimed c — Protocol 3.3 Step 2(c) first iteration.
     let mut d_shares: Vec<RssShare> = claimed_c.to_vec();
@@ -149,17 +186,11 @@ fn dzkp_core(
         let g2_ps: Vec<RssShare> = (0..n).map(|i| get_party_share(&g2_sharing, i, family)).collect();
         let q3_ps: Vec<RssShare> = (0..n).map(|i| get_party_share(&q3_sharing, i, family)).collect();
 
-        // σ accumulation runs every iteration — iteration 1 binds claimed c.
-        // ε_k is a fresh local PRG draw (Protocol 3.3 step 3(e) realised via
-        // F_coin = local rand). Per-prover-local; the aggregate Σ = Σ ε'_i σ_i
-        // = 0 under honest exec because each σ_i = 0 regardless of which ε_k
-        // this prover drew.
-        let epsilon = Fp::random(modulus, &mut rng);
-        for i in 0..n {
-            let check = d_shares[i].local_sub(&g1_ps[i]).local_sub(&g2_ps[i]);
-            let term = check.local_scalar_mul(&epsilon);
-            sigma_shares[i] = sigma_shares[i].local_add(&term);
-        }
+        // Residual of this fold (iteration 1 binds the claimed c). Its σ
+        // coefficient ε_k is drawn from F_Coin once all residuals are fixed.
+        residuals.push(
+            (0..n).map(|i| d_shares[i].local_sub(&g1_ps[i]).local_sub(&g2_ps[i])).collect(),
+        );
 
         transcript.append_field_element(&g1);
         transcript.append_field_element(&g2);
@@ -309,28 +340,29 @@ fn dzkp_core(
         lagrange_eval_on_shares(&pts, &r, modulus)
     }).collect();
 
-    // Final σ += ε·(d − q(1) − q(2)) using d = q(r_last) from the loop.
-    // ε is a fresh local PRG draw (Protocol 3.3 step 3(e) closing σ update).
-    let epsilon = Fp::random(modulus, &mut rng);
-    for i in 0..n {
-        let q1_sh = get_party_share(&q_sharings[1], i, family);
-        let q2_sh = get_party_share(&q_sharings[2], i, family);
-        let check = d_shares[i].local_sub(&q1_sh).local_sub(&q2_sh);
-        let term = check.local_scalar_mul(&epsilon);
-        sigma_shares[i] = sigma_shares[i].local_add(&term);
-    }
+    // Closing residual d − q(1) − q(2) with d = q(r_last) from the loop.
+    residuals.push(
+        (0..n)
+            .map(|i| {
+                let q1_sh = get_party_share(&q_sharings[1], i, family);
+                let q2_sh = get_party_share(&q_sharings[2], i, family);
+                d_shares[i].local_sub(&q1_sh).local_sub(&q2_sh)
+            })
+            .collect(),
+    );
 
     DzkpCoreShares {
         q_r: q_r_shares,
         f1_r: f1_r_shares,
         f2_r: f2_r_shares,
-        sigma: sigma_shares,
+        residuals,
     }
 }
 
 /// Batched variant of [`dzkp_core`] used by `dzkp_compute_batch` (Boyle
-/// Section 3.1.3). All n provers share the same `(ε_k, r_k)` sequence and
-/// `final_r`, pre-derived from one transcript; per-iter/per-base-case
+/// Section 3.1.3). All n provers share the same `r_k` sequence and
+/// `final_r`, pre-derived from one transcript, and the same F_Coin `ε_k`,
+/// drawn by the caller after every prover's residuals are fixed; per-iter/per-base-case
 /// transcript appends that bind the single-prover variant are dropped —
 /// soundness comes from the downstream σ aggregation and U/V/W triple-verify
 /// the caller performs over the n `DzkpCoreShares` outputs.
@@ -347,7 +379,6 @@ fn dzkp_core_batched(
     padded_len: usize,
     iter_challenges: &[Fp],
     final_r: &Fp,
-    final_epsilon: &Fp,
     family: &SubsetFamily,
     modulus: &BigUint,
     net: &mut SimulatedNetwork,
@@ -376,19 +407,17 @@ fn dzkp_core_batched(
     let two = Fp::new(BigUint::from(2u32), modulus);
     let three = Fp::new(BigUint::from(3u32), modulus);
 
-    let zero_sharing = share(&Fp::zero(modulus), family, modulus, &mut rng);
-    let mut sigma_shares: Vec<RssShare> =
-        (0..n).map(|i| get_party_share(&zero_sharing, i, family)).collect();
+    let mut residuals: Vec<Vec<RssShare>> = Vec::with_capacity(expected_iters + 1);
 
     // d starts as the claimed c (Protocol 3.3 Step 2(c), first-iter binding).
     let mut d_shares: Vec<RssShare> = claimed_c.to_vec();
 
     // F_coin: one invocation per Boyle Protocol 3.3 call producing the whole
-    // vector (ε_k)_{k=1..γ−1} of σ-update challenges (paper convention at
-    // 5-Online.tex:190 — F_Coin outputs a vector). The per-iteration rng
-    // draws below are the local realization of that single F_coin output;
-    // the protocol-level network cost (one RSS.Open of [r], one round) is
-    // charged here.
+    // vector (ε_k) of σ-update coefficients (paper convention at
+    // 5-Online.tex:190 — F_Coin outputs a vector). The values themselves are
+    // drawn with `f_coin` by `dzkp_compute_batch` after all provers'
+    // residuals are fixed; the protocol-level network cost (one RSS.Open of
+    // [r], one round) is charged here.
     crate::rss_share::charge_f_coin(net, family, modulus);
 
     let mut iter = 0usize;
@@ -410,6 +439,18 @@ fn dzkp_core_batched(
             q3 = &q3 + &(&fa3 * &fb3);
         }
 
+        // Test-only cheat: shift q(1) by +1 and q(2) by −1. This fold's own
+        // residual d − q(1) − q(2) stays zero, but d = q(r_k) is now wrong,
+        // so only the *next* residual is nonzero. σ = 0 then holds only if
+        // that residual's ε is 0 — which the prover could arrange when it
+        // chose ε itself, but not when ε comes from F_Coin.
+        #[cfg(test)]
+        if TAMPER_FOLD.with(|t| t.get()) == Some((prover_id, iter)) {
+            let delta = Fp::one(modulus);
+            g1 = &g1 + &delta;
+            g2 = &g2 - &delta;
+        }
+
         let g1_sharing = share(&g1, family, modulus, &mut rng);
         let g2_sharing = share(&g2, family, modulus, &mut rng);
         let q3_sharing = share(&q3, family, modulus, &mut rng);
@@ -423,23 +464,15 @@ fn dzkp_core_batched(
         let q3_ps: Vec<RssShare> =
             (0..n).map(|i| get_party_share(&q3_sharing, i, family)).collect();
 
-        // ε_k is the per-iteration σ-update challenge: a fresh local PRG
-        // sample (the local realization of the single F_coin vector output
-        // charged once before the loop). NOT loaded from the FS transcript;
-        // the aggregate Σ = Σ_i ε'_i σ_i = 0 under honest exec because each
-        // σ_i = 0 regardless of which ε_k each prover drew, so per-prover-
-        // local ε is sound. r_k still comes from the shared transcript so the
-        // U/V/W triple-verify points line up across the n parallel provers.
-        let epsilon = Fp::random(modulus, &mut rng);
+        // r_k comes from the shared transcript so the U/V/W triple-verify
+        // points line up across the n parallel provers.
         let r_k = iter_challenges[iter].clone();
 
-        // σ accumulation — first iter binds claimed c via d = c. r_k is
-        // shared across all n parallel provers (Boyle §3.1.3 aggregation).
-        for i in 0..n {
-            let check = d_shares[i].local_sub(&g1_ps[i]).local_sub(&g2_ps[i]);
-            let term = check.local_scalar_mul(&epsilon);
-            sigma_shares[i] = sigma_shares[i].local_add(&term);
-        }
+        // Residual of this fold — the first binds the claimed c via d = c.
+        // Its σ coefficient ε_k is an F_Coin output drawn by the caller.
+        residuals.push(
+            (0..n).map(|i| d_shares[i].local_sub(&g1_ps[i]).local_sub(&g2_ps[i])).collect(),
+        );
 
         d_shares = (0..n)
             .map(|i| {
@@ -580,21 +613,22 @@ fn dzkp_core_batched(
         })
         .collect();
 
-    // Final σ += ε·(d − q(1) − q(2)) with d = q(r_last). Shared ε from
-    // §3.1.3 — same draw used by every parallel prover.
-    for i in 0..n {
-        let q1_sh = get_party_share(&q_sharings[1], i, family);
-        let q2_sh = get_party_share(&q_sharings[2], i, family);
-        let check = d_shares[i].local_sub(&q1_sh).local_sub(&q2_sh);
-        let term = check.local_scalar_mul(final_epsilon);
-        sigma_shares[i] = sigma_shares[i].local_add(&term);
-    }
+    // Closing residual d − q(1) − q(2) with d = q(r_last).
+    residuals.push(
+        (0..n)
+            .map(|i| {
+                let q1_sh = get_party_share(&q_sharings[1], i, family);
+                let q2_sh = get_party_share(&q_sharings[2], i, family);
+                d_shares[i].local_sub(&q1_sh).local_sub(&q2_sh)
+            })
+            .collect(),
+    );
 
     DzkpCoreShares {
         q_r: q_r_shares,
         f1_r: f1_r_shares,
         f2_r: f2_r_shares,
-        sigma: sigma_shares,
+        residuals,
     }
 }
 
@@ -620,9 +654,13 @@ pub fn dzkp_compute(
     let shares = dzkp_core(
         prover_id, n, pairs, claimed_c, family, modulus, transcript, net, pre_shared, rand_counter,
     );
-    // F_coin charge for the closing σ-update ε draw inside `dzkp_core`
-    // (Boyle Protocol 3.3 step 3e). Mirrors the batched path's charge.
+    // F_coin for the σ-update coefficients (Boyle Protocol 3.3 step 3e),
+    // drawn only now that every residual is fixed. Mirrors the batched
+    // path's charge.
     crate::rss_share::charge_f_coin(net, family, modulus);
+    let epsilons: Vec<Fp> =
+        shares.residuals.iter().map(|_| f_coin(pre_shared, family, modulus)).collect();
+    let sigma_shares = fold_sigma(&shares.residuals, &epsilons, n, family, modulus);
 
     // Naive Π_RSS.Open of {q(r), f_1(r), f_2(r), σ}: each server broadcasts
     // its full holdings in clear (no hash compression). 1 round.
@@ -631,7 +669,7 @@ pub fn dzkp_compute(
     let q_r = ReplicatedSharing::reconstruct_from_party_shares(&shares.q_r, modulus);
     let f1_r = ReplicatedSharing::reconstruct_from_party_shares(&shares.f1_r, modulus);
     let f2_r = ReplicatedSharing::reconstruct_from_party_shares(&shares.f2_r, modulus);
-    let sigma = ReplicatedSharing::reconstruct_from_party_shares(&shares.sigma, modulus);
+    let sigma = ReplicatedSharing::reconstruct_from_party_shares(&sigma_shares, modulus);
 
     if q_r != &f1_r * &f2_r || !sigma.is_zero() {
         return DzkpResult::Abort;
@@ -741,9 +779,9 @@ pub fn dzkp_compute_batch(
 
     // Pre-derive shared r_k challenges from the transcript (Boyle §3.1.3 —
     // every parallel prover must see the same r_k so the per-prover proofs
-    // aggregate into one zk-FLIOP via the U/V/W triple-verify). The σ-update
-    // ε_k's are NOT shared (each prover draws its own via F_coin → local PRG;
-    // see `dzkp_core_batched`). final_r and final_epsilon stay shared via FS.
+    // aggregate into one zk-FLIOP via the U/V/W triple-verify). final_r is
+    // shared via FS too. The σ-update ε_k's are F_Coin outputs drawn after
+    // every prover's residuals are fixed (see below).
     let iter_challenges: Vec<Fp> = (0..gamma.saturating_sub(1))
         .map(|_| {
             transcript.append_bytes(b"r_k");
@@ -752,8 +790,6 @@ pub fn dzkp_compute_batch(
         .collect();
     transcript.append_bytes(b"final_r");
     let final_r = transcript.challenge(modulus);
-    transcript.append_bytes(b"epsilon_final_post");
-    let final_epsilon = transcript.challenge(modulus);
 
     let mut per_prover: Vec<DzkpCoreShares> = Vec::with_capacity(n);
     let mut parallel_prover_stats = CommStats::default();
@@ -781,7 +817,6 @@ pub fn dzkp_compute_batch(
             padded_len,
             &iter_challenges,
             &final_r,
-            &final_epsilon,
             family,
             modulus,
             &mut prover_net,
@@ -796,6 +831,17 @@ pub fn dzkp_compute_batch(
     for _ in 0..max_prover_rounds {
         net.next_round();
     }
+
+    // F_Coin: the σ-update coefficients ε_1..ε_γ, shared by all n provers
+    // (Protocol 6: "All instances share the same outputs ... of F_Coin") and
+    // drawn only now that every prover's residuals are fixed, so no prover
+    // can choose them. Network cost already charged inside each prover's
+    // `dzkp_core_batched`.
+    let epsilons: Vec<Fp> = (0..gamma).map(|_| f_coin(pre_shared, family, modulus)).collect();
+    let sigmas: Vec<Vec<RssShare>> = per_prover
+        .iter()
+        .map(|core| fold_sigma(&core.residuals, &epsilons, n, family, modulus))
+        .collect();
 
     // Step 4(d)/(5) — Boyle Section 3.1.3 aggregation. Collapse the n
     // per-prover 4-tuples into 4 aggregate scalars: (Σ, U(ρ), V(ρ), W(ρ)).
@@ -821,9 +867,9 @@ pub fn dzkp_compute_batch(
         .collect();
     let sigma_agg_shares: Vec<RssShare> = (0..n)
         .map(|s| {
-            let mut acc = per_prover[0].sigma[s].local_scalar_mul(&eps_primes[0]);
+            let mut acc = sigmas[0][s].local_scalar_mul(&eps_primes[0]);
             for i in 1..n {
-                let term = per_prover[i].sigma[s].local_scalar_mul(&eps_primes[i]);
+                let term = sigmas[i][s].local_scalar_mul(&eps_primes[i]);
                 acc = acc.local_add(&term);
             }
             acc
@@ -1046,7 +1092,7 @@ mod tests {
         // external-c binding gives us that the pair-only proof did not.
         let n = 3;
         let t = 1;
-        let modulus = BigUint::from(113u32);
+        let modulus = BigUint::from(2_305_843_009_213_693_951u64); // 2^61 − 1: a 1/p false failure is negligible
         let family = SubsetFamily::new(n, t);
         let pre_shared = setup_pre_shared(n, t, &modulus);
 
@@ -1170,7 +1216,7 @@ mod tests {
         // must abort because claimed_c_i no longer matches Σ a·b.
         let n = 3;
         let t = 1;
-        let modulus = BigUint::from(113u32);
+        let modulus = BigUint::from(2_305_843_009_213_693_951u64); // 2^61 − 1: a 1/p false failure is negligible
         let family = SubsetFamily::new(n, t);
         let pre_shared = setup_pre_shared(n, t, &modulus);
 
@@ -1194,7 +1240,7 @@ mod tests {
     fn test_dzkp_compute_batch_tampered_z_shares_aborts() {
         let n = 3;
         let t = 1;
-        let modulus = BigUint::from(113u32);
+        let modulus = BigUint::from(2_305_843_009_213_693_951u64); // 2^61 − 1: a 1/p false failure is negligible
         let family = SubsetFamily::new(n, t);
         let pre_shared = setup_pre_shared(n, t, &modulus);
 
@@ -1223,5 +1269,36 @@ mod tests {
             DzkpResult::Abort,
             "β check (step 7) must catch z-share tampering",
         );
+    }
+
+    /// Reviewer-requested negative test: a malicious prover that tampers with
+    /// a single folding layer must be rejected. The tamper keeps that layer's
+    /// residual zero and passes the U/V/W check, so σ is the only detector,
+    /// and σ only detects it because ε is an F_Coin output the prover cannot
+    /// choose. Uses p = 2^61 − 1 so that ε = 0 (prob. 1/p) cannot make the
+    /// test flaky.
+    #[test]
+    fn test_dzkp_compute_batch_tampered_fold_layer_aborts() {
+        let n = 3;
+        let t = 1;
+        let modulus = BigUint::from(2_305_843_009_213_693_951u64);
+        let family = SubsetFamily::new(n, t);
+        let pre_shared = setup_pre_shared(n, t, &modulus);
+
+        // 8 records → each prover has ≥ 8 pairs → ≥ 2 folds, so a tampered
+        // fold 0 is followed by a residual that exposes it.
+        let records: Vec<MulRecord> = (0..8u64)
+            .map(|c| build_random_record(c, &family, &modulus, &pre_shared))
+            .collect();
+
+        let (honest, _) = dzkp_compute_batch(&records, &family, &modulus, &pre_shared);
+        assert_eq!(honest, DzkpResult::Accept);
+
+        for prover in 0..n {
+            TAMPER_FOLD.with(|tf| tf.set(Some((prover, 0))));
+            let (verdict, _) = dzkp_compute_batch(&records, &family, &modulus, &pre_shared);
+            TAMPER_FOLD.with(|tf| tf.set(None));
+            assert_eq!(verdict, DzkpResult::Abort, "tampered fold of prover {prover} accepted");
+        }
     }
 }

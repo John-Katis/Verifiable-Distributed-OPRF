@@ -115,6 +115,36 @@ pub fn generate_rss_random(
     }
 }
 
+/// First counter of the F_Coin domain. PRF counters used by the offline and
+/// online protocols stay far below this, so coins never reuse a value that
+/// was derived for a sharing.
+const F_COIN_COUNTER_BASE: u64 = 1 << 48;
+
+/// Next unused F_Coin counter. Process-wide, so every coin drawn in a run is
+/// fresh, also across separate protocol invocations sharing one setup.
+static F_COIN_NEXT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(F_COIN_COUNTER_BASE);
+
+/// Functionality 𝓕_Coin: a fresh public random field element that no
+/// minority of parties can bias or predict before it is opened.
+///
+/// Realised as in the online phase (`vip.rs::coin_toss`): every party
+/// derives its RSS share of a random value from its replicated PRF keys at
+/// a fresh counter (no communication), and the value is opened by
+/// reconstruction. The network cost of the opening is charged by the
+/// caller via `rss_share::charge_f_coin*`.
+pub fn f_coin(
+    pre_shared: &[PreSharedMaterial],
+    family: &SubsetFamily,
+    modulus: &BigUint,
+) -> Fp {
+    let counter = F_COIN_NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let shares: Vec<RssShare> = (0..family.n)
+        .map(|i| generate_rss_random(i, counter, &pre_shared[i], family, modulus))
+        .collect();
+    ReplicatedSharing::reconstruct_from_party_shares(&shares, modulus)
+}
+
 /// Additive sharing of zero (Functionality 𝓕_Zero).
 ///
 /// Each party derives `z_i` from pairwise PRG keys so that `Σ_i z_i = 0`:
@@ -285,7 +315,7 @@ mod tests {
     fn test_double_sharing_different_counters() {
         let n = 3;
         let t = 1;
-        let modulus = BigUint::from(113u32);
+        let modulus = BigUint::from(2_305_843_009_213_693_951u64); // 2^61 − 1: a 1/p false failure is negligible
         let family = SubsetFamily::new(n, t);
         let pre_shared = setup_pre_shared(n, t, &modulus);
 
@@ -307,7 +337,7 @@ mod tests {
         // against a hypothetical PRF-only additive share: they must differ.
         let n = 3;
         let t = 1;
-        let modulus = BigUint::from(113u32);
+        let modulus = BigUint::from(2_305_843_009_213_693_951u64); // 2^61 − 1: a 1/p false failure is negligible
         let family = SubsetFamily::new(n, t);
         let pre_shared = setup_pre_shared(n, t, &modulus);
 
@@ -349,7 +379,7 @@ mod tests {
         // PRG-derived) — but every counter still sums to zero.
         let n = 3;
         let t = 1;
-        let modulus = BigUint::from(113u32);
+        let modulus = BigUint::from(2_305_843_009_213_693_951u64); // 2^61 − 1: a 1/p false failure is negligible
         let family = SubsetFamily::new(n, t);
         let pre_shared = setup_pre_shared(n, t, &modulus);
 
@@ -422,7 +452,7 @@ mod tests {
         // term ranges over 𝒜 only, but must still re-randomize the share.
         let n = 3;
         let t = 1;
-        let modulus = BigUint::from(113u32);
+        let modulus = BigUint::from(2_305_843_009_213_693_951u64); // 2^61 − 1: a 1/p false failure is negligible
         let family = SubsetFamily::new(n, t);
         let pre_shared = setup_pre_shared(n, t, &modulus);
 
