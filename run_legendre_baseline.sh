@@ -146,6 +146,8 @@ final_cleanup() {
     pkill -f "$DOPRF_DIR/server384" 2>/dev/null
     git -C "$DOPRF_ROOT" checkout -- Legendre-dOPRF-network 2>/dev/null
     git -C "$DOPRF_ROOT" clean -fd Legendre-dOPRF-network >/dev/null 2>&1
+    # The per-server byte files are git-ignored, so `git clean -fd` keeps them.
+    rm -f "$DOPRF_DIR"/server_offline_*.txt "$DOPRF_DIR"/server_tpsetup_bytes_*.txt "$DOPRF_DIR"/server_reindex_bytes_*.txt
 }
 trap final_cleanup EXIT
 

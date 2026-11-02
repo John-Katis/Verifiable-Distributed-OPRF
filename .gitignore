@@ -7,3 +7,8 @@
 
 /paper-sync/
 *.tex
+# Legendre-dOPRF per-server byte counts, written by the servers during
+# ./run_legendre_baseline.sh and read back by it (removed on exit)
+/d-OPRF/Legendre-dOPRF-network/server_offline_*.txt
+/d-OPRF/Legendre-dOPRF-network/server_tpsetup_bytes_*.txt
+/d-OPRF/Legendre-dOPRF-network/server_reindex_bytes_*.txt
